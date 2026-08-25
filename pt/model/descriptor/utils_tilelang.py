@@ -671,6 +671,7 @@ class FusedEdgeUpdateFunction(torch.autograd.Function):
 class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
     @staticmethod
     def forward(
+        ctx,
         grad_out: torch.Tensor,
         node_ebd: torch.Tensor,
         node_ebd_ext: torch.Tensor,
@@ -749,6 +750,18 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
         # bias
         grad_bias = grad_out.sum(dim=0)
 
+        ctx.save_for_backward(
+            grad_out,
+            node_ebd,
+            node_ebd_ext,
+            flat_edge_ebd,
+            n2e_index,
+            n_ext2e_index,
+            node_weight,
+            node_ext_weight,
+            edge_weight,
+        )
+
         return (
             grad_node,
             grad_node_ext,
@@ -762,8 +775,101 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
         )
 
     @staticmethod
-    def backward():
-        pass
+    def backward(
+        ctx,
+        grad_grad_node: torch.Tensor,
+        grad_grad_node_ext: torch.Tensor,
+        grad_grad_edge_ebd: torch.Tensor,
+        grad_grad_n2e_index: torch.Tensor,
+        grad_grad_n_ext2e_index: torch.Tensor,
+        grad_grad_node_weight: torch.Tensor,
+        grad_grad_node_ext_weight: torch.Tensor,
+        grad_grad_edge_weight: torch.Tensor,
+        grad_grad_bias: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, \
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        (
+            grad_out,
+            node_ebd,
+            node_ebd_ext,
+            flat_edge_ebd,
+            n2e_index,
+            n_ext2e_index,
+            node_weight,
+            node_ext_weight,
+            edge_weight,
+        ) = ctx.saved_tensors
+
+        E, K = grad_out.shape
+        N, D = node_ebd.shape
+
+        gathered_node = node_ebd[n2e_index]
+        gathered_node_ext = node_ebd_ext[n_ext2e_index]
+        grad_grad_out = torch.zeros_like(grad_out)
+
+        if grad_grad_node is not None:
+            grad_gathered_node = grad_grad_node[n2e_index]
+            grad_grad_out = grad_grad_out + grad_gathered_node @ node_weight
+        
+        if grad_grad_node_weight is not None:
+            grad_grad_out = grad_grad_out + gathered_node @ grad_grad_node_weight
+        
+        if grad_grad_node_ext is not None:
+            grad_gathered_node_ext = grad_grad_node_ext[n_ext2e_index]
+            grad_grad_out = grad_grad_out + grad_gathered_node_ext @ node_ext_weight
+        
+        if grad_grad_node_ext_weight is not None:
+            grad_grad_out = grad_grad_out + gathered_node_ext @ grad_grad_node_ext_weight
+
+        if grad_grad_edge_ebd is not None:
+            grad_grad_out = grad_grad_out + grad_grad_edge_ebd @ edge_weight
+
+        if grad_grad_edge_weight is not None:
+            grad_grad_out = grad_grad_out + flat_edge_ebd @ grad_grad_edge_weight
+
+        if grad_grad_bias is not None:
+            grad_grad_out = grad_grad_out + grad_grad_bias.unsqueeze(0)
+        
+        grad_node_ebd = torch.zeros_like(node_ebd)
+        if grad_grad_node_weight is not None:
+            grad_gathered_node_from_weight = grad_out @ grad_grad_node_weight.T
+            grad_node_ebd.index_add_(0, n2e_index, grad_gathered_node_from_weight)
+
+        grad_node_ebd_ext = torch.zeros_like(node_ebd_ext)
+        if grad_grad_node_ext_weight is not None:
+            grad_gathered_node_ext_from_weight = grad_out @ grad_grad_node_ext_weight.T
+            grad_node_ebd_ext.index_add_(0, n_ext2e_index, grad_gathered_node_ext_from_weight)
+
+        grad_flat_edge_ebd = torch.zeros_like(flat_edge_ebd)
+        if grad_grad_edge_weight is not None:
+            grad_flat_edge_ebd = grad_out @ grad_grad_edge_weight.T
+
+        grad_node_weight = torch.zeros_like(node_weight)
+        if grad_grad_node is not None:
+            grad_gathered_node = grad_grad_node[n2e_index]
+            grad_node_weight = grad_gathered_node.T @ grad_out
+
+        grad_node_ext_weight = torch.zeros_like(node_ext_weight)
+
+        if grad_grad_node_ext is not None:
+            grad_gathered_node_ext = grad_grad_node_ext[n_ext2e_index]
+            grad_node_ext_weight = grad_gathered_node_ext.T @ grad_out
+
+        grad_edge_weight = torch.zeros_like(edge_weight)
+        if grad_grad_edge_ebd is not None:
+            grad_edge_weight = grad_grad_edge_ebd.T @ grad_out
+
+        return (
+            grad_grad_out,           # 0 grad_out
+            grad_node_ebd,           # 1 node_ebd
+            grad_node_ebd_ext,       # 2 node_ebd_ext
+            grad_flat_edge_ebd,      # 3 flat_edge_ebd
+            None,                    # 4 n2e_index
+            None,                    # 5 n_ext2e_index
+            grad_node_weight,        # 6 node_weight
+            grad_node_ext_weight,    # 7 node_ext_weight
+            grad_edge_weight,        # 8 edge_weight
+        )
 
 @tilelang.jit
 def fused_angle_update_forward(
@@ -900,18 +1006,18 @@ class FusedAngleUpdateFunction(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        flat_angle_ebd,
-        node_ebd,
-        flat_edge_ebd,
-        n2a_index,
-        eij2a_index,
-        eik2a_index,
-        sub_angle,
-        sub_node,
-        sub_edge_ik,
-        sub_edge_ij,
-        bias,
-    ):
+        flat_angle_ebd: torch.Tensor,
+        node_ebd: torch.Tensor,
+        flat_edge_ebd: torch.Tensor,
+        n2a_index: torch.Tensor,
+        eij2a_index: torch.Tensor,
+        eik2a_index: torch.Tensor,
+        sub_angle: torch.Tensor,
+        sub_node: torch.Tensor,
+        sub_edge_ik: torch.Tensor,
+        sub_edge_ij: torch.Tensor,
+        bias: torch.Tensor,
+    ) -> torch.Tensor:
         nf, nloc, node_dim = node_ebd.shape
         angle_dim = flat_angle_ebd.shape[-1]
         edge_dim = flat_edge_ebd.shape[-1]
@@ -979,7 +1085,11 @@ class FusedAngleUpdateFunction(torch.autograd.Function):
         return result_update
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(
+        ctx,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, \
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         (
             flat_angle_ebd,
             flat_node_ebd,
@@ -992,64 +1102,23 @@ class FusedAngleUpdateFunction(torch.autograd.Function):
             sub_edge_ik,
             sub_edge_ij,
         ) = ctx.saved_tensors
+        node_ebd_shape = ctx.node_ebd_shape
 
-        grad_output = grad_output.contiguous()
+        output = FusedAngleUpdateFunctionBackward.apply(grad_output, flat_angle_ebd, flat_node_ebd,
+            flat_edge_ebd, n2a_index, eij2a_index, eik2a_index,
+            sub_angle, sub_node, sub_edge_ik, sub_edge_ij, node_ebd_shape)
+        
+        (
+            grad_flat_angle_ebd,
+            grad_node_ebd,
+            grad_flat_edge_ebd,
+            grad_sub_angle,
+            grad_sub_node,
+            grad_sub_edge_ik,
+            grad_sub_edge_ij,
+            grad_bias,
+        ) = output
 
-        grad_flat_angle_ebd = torch.matmul(grad_output, sub_angle.transpose(0, 1))
-
-        grad_gathered_node = torch.matmul(grad_output, sub_node.transpose(0, 1))
-
-        grad_flat_node_ebd = torch.zeros(flat_node_ebd.shape, device=grad_output.device, dtype=grad_output.dtype)
-
-        grad_flat_node_ebd.index_add_(
-            0,
-            n2a_index,
-            grad_gathered_node,
-        )
-
-        grad_node_ebd = grad_flat_node_ebd.reshape(ctx.node_ebd_shape)
-        grad_gathered_edge_ik = torch.matmul(grad_output, sub_edge_ik.transpose(0, 1))
-        grad_gathered_edge_ij = torch.matmul(grad_output, sub_edge_ij.transpose(0, 1))
-
-        grad_flat_edge_ebd = torch.zeros(flat_edge_ebd.shape, device=grad_output.device, dtype=grad_output.dtype)
-        grad_flat_edge_ebd.index_add_(
-            0,
-            eik2a_index,
-            grad_gathered_edge_ik,
-        )
-
-        grad_flat_edge_ebd.index_add_(
-            0,
-            eij2a_index,
-            grad_gathered_edge_ij,
-        )
-
-        grad_sub_angle = torch.matmul(flat_angle_ebd.transpose(0, 1), grad_output)
-
-        gathered_node = torch.index_select(
-            flat_node_ebd,
-            0,
-            n2a_index,
-        )
-        grad_sub_node = torch.matmul(gathered_node.transpose(0, 1), grad_output)
-
-        gathered_edge_ik = torch.index_select(
-            flat_edge_ebd,
-            0,
-            eik2a_index,
-        )
-
-        grad_sub_edge_ik = torch.matmul(gathered_edge_ik.transpose(0, 1), grad_output)
-
-        gathered_edge_ij = torch.index_select(
-            flat_edge_ebd,
-            0,
-            eij2a_index,
-        )
-
-        grad_sub_edge_ij = torch.matmul(gathered_edge_ij.transpose(0, 1), grad_output)
-
-        grad_bias = grad_output.sum(dim=0)
         
         return (
             grad_flat_angle_ebd,
@@ -1063,4 +1132,176 @@ class FusedAngleUpdateFunction(torch.autograd.Function):
             grad_sub_edge_ik,
             grad_sub_edge_ij,
             grad_bias,
+        )
+
+class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        grad_output: torch.Tensor,
+        flat_angle_ebd: torch.Tensor,
+        flat_node_ebd: torch.Tensor,
+        flat_edge_ebd: torch.Tensor,
+        n2a_index: torch.Tensor,
+        eij2a_index: torch.Tensor,
+        eik2a_index: torch.Tensor,
+        sub_angle: torch.Tensor,
+        sub_node: torch.Tensor,
+        sub_edge_ik: torch.Tensor,
+        sub_edge_ij: torch.Tensor,
+        node_ebd_shape,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, \
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        grad_output = grad_output.contiguous()
+
+        grad_flat_angle_ebd = torch.matmul(grad_output, sub_angle.transpose(0, 1))
+        grad_gathered_node = torch.matmul(grad_output, sub_node.transpose(0, 1))
+        
+        grad_flat_node_ebd = torch.zeros(flat_node_ebd.shape, device=grad_output.device, dtype=grad_output.dtype)
+        grad_flat_node_ebd.index_add_(0, n2a_index, grad_gathered_node)
+        grad_node_ebd = grad_flat_node_ebd.reshape(node_ebd_shape)
+        
+        grad_gathered_edge_ik = torch.matmul(grad_output, sub_edge_ik.transpose(0, 1))
+        grad_gathered_edge_ij = torch.matmul(grad_output, sub_edge_ij.transpose(0, 1))
+        grad_flat_edge_ebd = torch.zeros(flat_edge_ebd.shape, device=grad_output.device, dtype=grad_output.dtype)
+        grad_flat_edge_ebd.index_add_(0, eik2a_index, grad_gathered_edge_ik)
+        grad_flat_edge_ebd.index_add_(0, eij2a_index, grad_gathered_edge_ij)
+        grad_sub_angle = torch.matmul(flat_angle_ebd.transpose(0, 1), grad_output)
+
+        gathered_node = torch.index_select(flat_node_ebd, 0, n2a_index)
+        grad_sub_node = torch.matmul(gathered_node.transpose(0, 1), grad_output)
+
+        gathered_edge_ik = torch.index_select(flat_edge_ebd, 0, eik2a_index)
+        grad_sub_edge_ik = torch.matmul(gathered_edge_ik.transpose(0, 1), grad_output)
+        gathered_edge_ij = torch.index_select(flat_edge_ebd, 0, eij2a_index)
+        grad_sub_edge_ij = torch.matmul(gathered_edge_ij.transpose(0, 1), grad_output)
+
+        grad_bias = grad_output.sum(dim=0)
+
+        ctx.save_for_backward(
+            grad_output,
+            flat_angle_ebd,
+            flat_node_ebd,
+            flat_edge_ebd,
+            n2a_index,
+            eij2a_index,
+            eik2a_index,
+            sub_angle,
+            sub_node,
+            sub_edge_ik,
+            sub_edge_ij,
+        )
+        
+        return (
+            grad_flat_angle_ebd,
+            grad_node_ebd,
+            grad_flat_edge_ebd,
+            grad_sub_angle,
+            grad_sub_node,
+            grad_sub_edge_ik,
+            grad_sub_edge_ij,
+            grad_bias,
+        )
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_grad_flat_angle_ebd,
+        grad_grad_node_ebd,
+        grad_grad_flat_edge_ebd,
+        grad_grad_sub_angle,
+        grad_grad_sub_node,
+        grad_grad_sub_edge_ik,
+        grad_grad_sub_edge_ij,
+        grad_grad_bias,
+    ):
+        (
+            grad_output,
+            flat_angle_ebd,
+            flat_node_ebd,
+            flat_edge_ebd,
+            n2a_index,
+            eij2a_index,
+            eik2a_index,
+            sub_angle,
+            sub_node,
+            sub_edge_ik,
+            sub_edge_ij,
+        ) = ctx.saved_tensors
+
+        grad_grad_output = torch.zeros_like(grad_output)
+        grad_flat_angle_ebd = torch.zeros_like(flat_angle_ebd)
+        grad_flat_node_ebd = torch.zeros_like(flat_node_ebd)
+        grad_flat_edge_ebd = torch.zeros_like(flat_edge_ebd)
+        grad_sub_angle = torch.zeros_like(sub_angle)
+        grad_sub_node = torch.zeros_like(sub_node)
+        grad_sub_edge_ik = torch.zeros_like(sub_edge_ik)
+        grad_sub_edge_ij = torch.zeros_like(sub_edge_ij)
+        
+        # angle
+        if grad_grad_flat_angle_ebd is not None:
+            grad_grad_output += torch.matmul(grad_grad_flat_angle_ebd, sub_angle)
+            grad_sub_angle += torch.matmul(grad_grad_flat_angle_ebd.transpose(0, 1), grad_output)
+
+        if grad_grad_sub_angle is not None:
+            grad_grad_output += torch.matmul(flat_angle_ebd, grad_grad_sub_angle)
+            grad_flat_angle_ebd += torch.matmul(grad_output, grad_grad_sub_angle.transpose(0, 1))
+        
+        # node
+        gathered_node = torch.index_select(flat_node_ebd, 0, n2a_index)
+
+        if grad_grad_node_ebd is not None:
+            grad_grad_flat_node_ebd = grad_grad_node_ebd.reshape(flat_node_ebd.shape)
+            gathered_grad_node = torch.index_select(grad_grad_flat_node_ebd, 0, n2a_index)
+            grad_grad_output += torch.matmul(gathered_grad_node, sub_node)
+
+            grad_sub_node += torch.matmul(gathered_grad_node.transpose(0, 1), grad_output)
+
+        if grad_grad_sub_node is not None:
+            grad_grad_output += torch.matmul(gathered_node, grad_grad_sub_node)
+            grad_gathered_node = torch.matmul(grad_output, grad_grad_sub_node.transpose(0, 1))
+            grad_flat_node_ebd.index_add_(0, n2a_index, grad_gathered_node)
+        
+        # edge_ik
+        gathered_edge_ik = torch.index_select(flat_edge_ebd, 0, eik2a_index)
+
+        if grad_grad_flat_edge_ebd is not None:
+            gathered_grad_edge_ik = torch.index_select(grad_grad_flat_edge_ebd, 0, eik2a_index)
+            grad_grad_output += torch.matmul(gathered_grad_edge_ik, sub_edge_ik)
+            grad_sub_edge_ik += torch.matmul(gathered_grad_edge_ik.transpose(0, 1), grad_output)
+
+        if grad_grad_sub_edge_ik is not None:
+            grad_grad_output += torch.matmul(gathered_edge_ik, grad_grad_sub_edge_ik)
+            grad_gathered_edge_ik = torch.matmul(grad_output, grad_grad_sub_edge_ik.transpose(0, 1))
+            grad_flat_edge_ebd.index_add_(0, eik2a_index, grad_gathered_edge_ik)
+        
+        # edge_ij
+        gathered_edge_ij = torch.index_select(flat_edge_ebd, 0, eij2a_index)
+
+        if grad_grad_flat_edge_ebd is not None:
+            gathered_grad_edge_ij = torch.index_select(grad_grad_flat_edge_ebd, 0, eij2a_index)
+            grad_grad_output += torch.matmul(gathered_grad_edge_ij, sub_edge_ij)
+            grad_sub_edge_ij += torch.matmul(gathered_grad_edge_ij.transpose(0, 1), grad_output)
+
+        if grad_grad_sub_edge_ij is not None:
+            grad_grad_output += torch.matmul(gathered_edge_ij, grad_grad_sub_edge_ij)
+            grad_gathered_edge_ij = torch.matmul(grad_output, grad_grad_sub_edge_ij.transpose(0, 1))
+            grad_flat_edge_ebd.index_add_(0, eij2a_index, grad_gathered_edge_ij)
+
+        if grad_grad_bias is not None:
+            grad_grad_output += grad_grad_bias.unsqueeze(0)
+
+        return (
+            grad_grad_output,       # 0  grad_output
+            grad_flat_angle_ebd,    # 1  flat_angle_ebd
+            grad_flat_node_ebd,     # 2  flat_node_ebd
+            grad_flat_edge_ebd,     # 3  flat_edge_ebd
+            None,                   # 4  n2a_index
+            None,                   # 5  eij2a_index
+            None,                   # 6  eik2a_index
+            grad_sub_angle,         # 7  sub_angle
+            grad_sub_node,          # 8  sub_node
+            grad_sub_edge_ik,       # 9  sub_edge_ik
+            grad_sub_edge_ij,       # 10 sub_edge_ij
+            None,                   # 11 node_ebd_shape
         )
