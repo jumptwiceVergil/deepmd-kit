@@ -754,10 +754,7 @@ class RepFlowLayer(torch.nn.Module):
         sub_edge_update = torch.matmul(flat_edge_ebd, edge)
 
         result_update = bias + sub_node_update + sub_edge_update + sub_node_ext_update
-        # torch.save(
-        #     sub_node_update.detach().cpu(),
-        #     "/workspace/DP/sub_node_update_original.pt"
-        # )
+        
         return result_update
 
     def fused_optim_edge_update_dynamic(
@@ -779,9 +776,6 @@ class RepFlowLayer(torch.nn.Module):
         nf, nall, node_dim = node_ebd_ext.shape
         _, nloc, _ = node_ebd.shape
         edge_dim = flat_edge_ebd.shape[-1]
-
-        n_nodes_loc = nf * nloc
-        n_nodes_ext = nf * nall
 
         # node_dim, node_dim, edge_dim
         node, node_ext, edge = torch.split(matrix, [node_dim, node_dim, edge_dim])
