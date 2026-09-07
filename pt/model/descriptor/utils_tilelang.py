@@ -1,6 +1,83 @@
 import torch
 import tilelang
 import tilelang.language as T
+import weakref
+from collections import OrderedDict
+
+
+# Small, bounded cache shared by layers that use views of the same graph index.
+# Weak references prevent stale data-pointer reuse; tensor versions invalidate
+# metadata after normal in-place PyTorch updates. Graph indices are immutable
+# during a forward/backward. Mutations through .data/external pointers are not
+# supported (as with autograd's own saved-tensor version checks).
+_sym_owner_cache = OrderedDict()
+_SYM_OWNER_CACHE_SIZE = 8
+
+
+def _sym_owner_metadata(owner, num_owner):
+    """Return (uniform, offsets, edge_order) for an arbitrary owner vector.
+
+    Uniform means exactly [0]*R + [1]*R + ... . Only metadata creation
+    synchronizes with the CPU; cache hits do not. Offsets include empty owners.
+    """
+    if num_owner <= 0 or owner.ndim != 1:
+        raise ValueError("owner must be one-dimensional and num_owner positive")
+    if owner.dtype not in (torch.int32, torch.int64):
+        raise TypeError("owner must use int32 or int64 indices")
+    base = owner
+    while base._base is not None:
+        base = base._base
+    key = (id(base), owner.data_ptr(), owner.numel(), owner.stride(),
+           owner._version, num_owner, owner.device)
+    cached = _sym_owner_cache.get(key)
+    if cached is not None and cached[0]() is base:
+        _sym_owner_cache.move_to_end(key)
+        return cached[1]
+    if owner.numel() and bool(((owner < 0) | (owner >= num_owner)).any()):
+        raise ValueError("owner indices must be in [0, num_owner)")
+    count = owner.numel()
+    uniform = False
+    if count and count % num_owner == 0:
+        expected = torch.arange(num_owner, device=owner.device, dtype=owner.dtype)
+        uniform = torch.equal(owner, expected.repeat_interleave(count // num_owner))
+    if uniform:
+        result = (True, None, None)
+    else:
+        counts = torch.bincount(owner.long(), minlength=num_owner)
+        offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0)))
+        sorted_owner = count < 2 or bool((owner[1:] >= owner[:-1]).all())
+        order = (torch.arange(count, device=owner.device, dtype=torch.int64)
+                 if sorted_owner else torch.argsort(owner, stable=True))
+        result = (False, offsets, order)
+    _sym_owner_cache[key] = (weakref.ref(base), result)
+    _sym_owner_cache.move_to_end(key)
+    while len(_sym_owner_cache) > _SYM_OWNER_CACHE_SIZE:
+        _sym_owner_cache.popitem(last=False)
+    return result
+
+
+@tilelang.jit
+def fused_cal_hg_dynamic_forward_segmented(M, E, NO, BLOCK_N=64):
+    @T.prim_func
+    def kernel(
+        edge: T.Buffer((M, E), "float32"),
+        sw: T.Buffer((M,), "float32"),
+        h: T.Buffer((M, 3), "float32"),
+        offsets: T.Buffer((NO + 1,), "int64"),
+        order: T.Buffer((M,), "int64"),
+        scale: T.float32,
+        out: T.Buffer((NO, 3 * E), "float32"),
+    ):
+        with T.Kernel(NO, T.ceildiv(3 * E, BLOCK_N), threads=64) as (o, tile):
+            for j in T.Parallel(BLOCK_N):
+                col = tile * BLOCK_N + j
+                if col < 3 * E:
+                    acc = T.alloc_var("float32", init=0)
+                    for r in T.serial(offsets[o], offsets[o + 1]):
+                        m = order[r]
+                        acc += edge[m, col % E] * sw[m] * h[m, col // E]
+                    out[o, col] = acc * scale
+    return kernel
 
 @tilelang.jit
 def fused_cal_hg_dynamic_forward_v0(
@@ -474,8 +551,18 @@ class FusedSymmetrizationOpDynamic(torch.autograd.Function):
             dtype=flat_edge_ebd.dtype,
         )
 
-        hg_kernel = fused_cal_hg_dynamic_forward_v1(M=n_edge, N=3*e_dim, E=e_dim, NO=num_owner)
-        hg_kernel(flat_edge_ebd, flat_sw, flat_h2, scale_factor, h2g2)
+        # Original uniform-only implementation:
+        # hg_kernel = fused_cal_hg_dynamic_forward_v1(M=n_edge, N=3*e_dim, E=e_dim, NO=num_owner)
+        # hg_kernel(flat_edge_ebd, flat_sw, flat_h2, scale_factor, h2g2)
+        uniform, offsets, order = _sym_owner_metadata(owner, num_owner)
+        if n_edge == 0:
+            h2g2.zero_()
+        elif uniform:
+            hg_kernel = fused_cal_hg_dynamic_forward_v1(M=n_edge, N=3*e_dim, E=e_dim, NO=num_owner)
+            hg_kernel(flat_edge_ebd, flat_sw, flat_h2, scale_factor, h2g2)
+        else:
+            hg_kernel = fused_cal_hg_dynamic_forward_segmented(M=n_edge, E=e_dim, NO=num_owner)
+            hg_kernel(flat_edge_ebd, flat_sw, flat_h2, offsets, order, scale_factor, h2g2)
         h2g2 = h2g2.reshape(nb, nloc, 3, e_dim)
 
         # # nb x nloc x 3 x e_dim
@@ -857,6 +944,83 @@ def fused_symmetrization_double_backward_edge(
 
     return double_backward_edge
 
+@tilelang.jit
+def fused_symmetrization_double_backward_owner_segmented(
+    M,
+    E,
+    NO,
+    A,
+    dtype="float32",
+    accum_dtype="float32",
+    THREADS=128,
+):
+    """Fuse the owner reduction and the two Gram-matrix VJPs."""
+    # Original uniform-only bounds are retained in the original kernel above.
+
+    @T.prim_func
+    def double_backward_owner(
+        grad_grrg: T.Buffer((1, NO, A * E), dtype),
+        h2g2: T.Buffer((1, NO, 3, E), dtype),
+        flat_edge_ebd: T.Buffer((M, E), dtype),
+        flat_h2: T.Buffer((M, 3), dtype),
+        flat_sw: T.Buffer((M,), dtype),
+        grad_grad_edge: T.Buffer((M, E), dtype),
+        grad_grad_h2: T.Buffer((M, 3), dtype),
+        grad_grad_sw: T.Buffer((M,), dtype),
+        offsets: T.Buffer((NO + 1,), "int64"),
+        order: T.Buffer((M,), "int64"),
+        scale_factor: T.float32,
+        grad_grad_grrg: T.Buffer((1, NO, A * E), accum_dtype),
+        grad_h2g2: T.Buffer((1, NO, 3, E), accum_dtype),
+    ):
+        with T.Kernel(NO, threads=THREADS) as (owner_idx,):
+            grad_q = T.alloc_shared((3, E), accum_dtype)
+
+            # d(phi) / dR, reduced over all edges owned by this atom.
+            for b, d in T.Parallel(3, E):
+                acc = T.alloc_var(accum_dtype, init=0)
+                # Original: for r in T.serial(EDGES_PER_OWNER)
+                # Original: edge_idx = owner_idx * EDGES_PER_OWNER + r
+                for r in T.serial(offsets[owner_idx], offsets[owner_idx + 1]):
+                    edge_idx = order[r]
+                    edge = flat_edge_ebd[edge_idx, d]
+                    h = flat_h2[edge_idx, b]
+                    sw = flat_sw[edge_idx]
+                    acc += (
+                        grad_grad_h2[edge_idx, b] * edge * sw
+                        + grad_grad_edge[edge_idx, d] * h * sw
+                        + grad_grad_sw[edge_idx] * h * edge
+                    )
+                grad_q[b, d] = acc
+
+            T.sync_threads()
+
+            c = scale_factor / 3.0
+
+            # Gradient with respect to the incoming first-order gradient G.
+            for a, d in T.Parallel(A, E):
+                acc = T.alloc_var(accum_dtype, init=0)
+                for b in T.serial(3):
+                    acc += (
+                        h2g2[0, owner_idx, b, a] * grad_q[b, d]
+                        + grad_q[b, a] * h2g2[0, owner_idx, b, d]
+                    )
+                grad_grad_grrg[0, owner_idx, a * E + d] = acc * c
+
+            # Gradient with respect to H.  The next fused kernel propagates
+            # this through H = scale * aggregate(h2 * edge * sw).
+            for b, d in T.Parallel(3, E):
+                acc = T.alloc_var(accum_dtype, init=0)
+                for a in T.serial(A):
+                    acc += grad_q[b, a] * grad_grrg[0, owner_idx, a * E + d]
+                if d < A:
+                    for k in T.serial(E):
+                        acc += grad_q[b, k] * grad_grrg[0, owner_idx, d * E + k]
+                grad_h2g2[0, owner_idx, b, d] = acc * c
+
+    return double_backward_owner
+
+
 class FusedSymmetrizationOpDynamicBackward(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -902,6 +1066,8 @@ class FusedSymmetrizationOpDynamicBackward(torch.autograd.Function):
         # grad_h2g2 /= 3.0
         # grad_h2g2 *= scale_factor
 
+        # Resolve once, retaining the metadata even if the bounded cache evicts it.
+        ctx.owner_metadata = _sym_owner_metadata(owner, num_owner)
         owner = owner.long()
         grad_flat_h2g2 = torch.empty(
             (M, 3, E),
@@ -912,9 +1078,13 @@ class FusedSymmetrizationOpDynamicBackward(torch.autograd.Function):
         grad_h2 = torch.empty_like(flat_h2)
         grad_flat_sw = torch.empty_like(flat_sw)
 
-        hg_backward_kernel = fused_call_hg_dynamic_backward(M=M, E=E, NB=nb, NLOC=nloc)
-        hg_backward_kernel(grad_h2g2, flat_edge_ebd, flat_h2, flat_sw, \
-            owner, grad_flat_h2g2, grad_flat_edge_ebd, grad_h2, grad_flat_sw)
+        # hg_backward_kernel = fused_call_hg_dynamic_backward(M=M, E=E, NB=nb, NLOC=nloc)
+        # hg_backward_kernel(grad_h2g2, flat_edge_ebd, flat_h2, flat_sw,
+        #     owner, grad_flat_h2g2, grad_flat_edge_ebd, grad_h2, grad_flat_sw)
+        if M:
+            hg_backward_kernel = fused_call_hg_dynamic_backward(M=M, E=E, NB=nb, NLOC=nloc)
+            hg_backward_kernel(grad_h2g2, flat_edge_ebd, flat_h2, flat_sw,
+                owner, grad_flat_h2g2, grad_flat_edge_ebd, grad_h2, grad_flat_sw)
 
         # grad_flat_h2g2 = grad_h2g2[0, owner, :, :]
 
@@ -1062,26 +1232,27 @@ class FusedSymmetrizationOpDynamicBackward(torch.autograd.Function):
 
         grad_grad_grrg = torch.empty_like(grad_grrg)
         grad_h2g2 = torch.empty_like(h2g2)
-        owner_kernel = fused_symmetrization_double_backward_owner(
-            M=M,
-            E=E,
-            NO=num_owner,
-            A=axis_neuron,
-            dtype=dtype,
-        )
+        # Original uniform-only dispatch (kernel itself is preserved above):
+        # owner_kernel = fused_symmetrization_double_backward_owner(
+        #     M=M, E=E, NO=num_owner, A=axis_neuron, dtype=dtype)
+        # owner_kernel(grad_grrg, h2g2, flat_edge_ebd, flat_h2, flat_sw,
+        #     grad_grad_edge, grad_grad_h2, grad_grad_sw, float(scale_factor),
+        #     grad_grad_grrg, grad_h2g2)
+        if M == 0:
+            # No edges: all first and second derivatives are zero. Avoid
+            # launching zero-grid CUDA kernels or compiling zero-sized buffers.
+            return (torch.zeros_like(grad_grrg), torch.zeros_like(flat_edge_ebd),
+                    torch.zeros_like(flat_h2), torch.zeros_like(flat_sw),
+                    None, None, None, None, None, None, None)
+        uniform, offsets, order = ctx.owner_metadata
+        factory = (fused_symmetrization_double_backward_owner if uniform
+                   else fused_symmetrization_double_backward_owner_segmented)
+        owner_kernel = factory(M=M, E=E, NO=num_owner, A=axis_neuron, dtype=dtype)
+        metadata_args = () if uniform else (offsets, order)
         owner_kernel(
-            grad_grrg,
-            h2g2,
-            flat_edge_ebd,
-            flat_h2,
-            flat_sw,
-            grad_grad_edge,
-            grad_grad_h2,
-            grad_grad_sw,
-            float(scale_factor),
-            grad_grad_grrg,
-            grad_h2g2,
-        )
+            grad_grrg, h2g2, flat_edge_ebd, flat_h2, flat_sw,
+            grad_grad_edge, grad_grad_h2, grad_grad_sw,
+            *metadata_args, float(scale_factor), grad_grad_grrg, grad_h2g2)
 
         grad_flat_edge_ebd = torch.empty_like(flat_edge_ebd)
         grad_flat_h2 = torch.empty_like(flat_h2)
