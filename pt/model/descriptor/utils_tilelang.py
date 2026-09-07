@@ -3,6 +3,289 @@ import tilelang
 import tilelang.language as T
 
 @tilelang.jit
+def fused_cal_hg_dynamic_forward_v0(
+    M,              # n_edge
+    N,              # 3 * e_dim
+    E,              # e_dim
+    NO,             # num_owner
+    dtype="float32",
+    accum_dtype="float32",
+    BLOCK_N: int = 64,
+):
+    assert M % NO == 0
+    EDGES_PER_OWNER = M // NO
+
+    @T.prim_func
+    def hg_kernel(
+        flat_edge_ebd: T.Buffer((M, E), dtype),
+        flat_sw: T.Buffer((M,), dtype),
+        flat_h2: T.Buffer((M, 3), dtype),
+        scale_factor: T.float32,
+        out: T.Buffer((NO, N), accum_dtype),
+    ):
+        with T.Kernel(
+            NO,
+            T.ceildiv(N, BLOCK_N),
+            threads=64,
+        ) as (bx, by):
+
+            acc = T.alloc_fragment(
+                (BLOCK_N,),
+                accum_dtype,
+            )
+            T.clear(acc)
+
+            # ---------------------------------------------------------
+            # 纯融合版本：
+            #
+            # 1. 不使用 shared memory
+            # 2. 不展开 EDGES_PER_OWNER
+            # 3. 直接从 global memory 读取 sw / h2 / edge_ebd
+            # 4. 使用普通 serial reduction
+            # ---------------------------------------------------------
+            for j in T.Parallel(BLOCK_N):
+                col = by * BLOCK_N + j
+
+                if col < N:
+                    h2_idx = col // E
+                    e_idx = col % E
+
+                    for r in T.serial(EDGES_PER_OWNER):
+                        edge_idx = bx * EDGES_PER_OWNER + r
+
+                        acc[j] += (
+                            flat_edge_ebd[edge_idx, e_idx]
+                            * flat_sw[edge_idx]
+                            * flat_h2[edge_idx, h2_idx]
+                        )
+
+                    acc[j] = acc[j] * scale_factor
+
+            # 写回
+            for j in T.Parallel(BLOCK_N):
+                col = by * BLOCK_N + j
+
+                if col < N:
+                    out[bx, col] = acc[j]
+
+    return hg_kernel
+
+@tilelang.jit
+def fused_cal_hg_dynamic_forward_v1(
+    M,              # n_edge
+    N,              # 3 * e_dim
+    E,              # e_dim
+    NO,             # num_owner
+    dtype="float32",
+    accum_dtype="float32",
+    BLOCK_N: int = 64,
+):
+    assert M % NO == 0
+    EDGES_PER_OWNER = M // NO
+
+    @T.prim_func
+    def hg_kernel(
+        flat_edge_ebd: T.Buffer((M, E), dtype),
+        flat_sw: T.Buffer((M,), dtype),
+        flat_h2: T.Buffer((M, 3), dtype),
+        scale_factor: T.float32,
+        out: T.Buffer((NO, N), accum_dtype),
+    ):
+        with T.Kernel(
+            NO,
+            T.ceildiv(N, BLOCK_N),
+            threads=64,
+        ) as (bx, by):
+
+            # ---------------------------------------------------------
+            # Optimization 1:
+            # sw + h2 合并加载到 shared memory
+            # ---------------------------------------------------------
+            meta_shared = T.alloc_shared(
+                (EDGES_PER_OWNER, 4),
+                dtype,
+            )
+
+            # sw
+            for r in T.Parallel(EDGES_PER_OWNER):
+                edge_idx = bx * EDGES_PER_OWNER + r
+                meta_shared[r, 0] = flat_sw[edge_idx]
+
+            # h2
+            for r, k in T.Parallel(EDGES_PER_OWNER, 3):
+                edge_idx = bx * EDGES_PER_OWNER + r
+                meta_shared[r, k + 1] = flat_h2[edge_idx, k]
+
+            # 必须保证 shared memory 写入完成
+            T.sync_threads()
+
+            acc = T.alloc_fragment(
+                (BLOCK_N,),
+                accum_dtype,
+            )
+            T.clear(acc)
+
+            # ---------------------------------------------------------
+            # Optimization 1 ONLY:
+            # 使用 shared memory 中的 sw / h2
+            #
+            # 这里故意不做 v2 的手工展开
+            # ---------------------------------------------------------
+            for j in T.Parallel(BLOCK_N):
+                col = by * BLOCK_N + j
+
+                if col < N:
+                    h2_idx = col // E
+                    e_idx = col % E
+
+                    for r in T.serial(EDGES_PER_OWNER):
+                        edge_idx = bx * EDGES_PER_OWNER + r
+
+                        acc[j] += (
+                            flat_edge_ebd[edge_idx, e_idx]
+                            * meta_shared[r, 0]
+                            * meta_shared[r, h2_idx + 1]
+                        )
+
+                    acc[j] = acc[j] * scale_factor
+
+            for j in T.Parallel(BLOCK_N):
+                col = by * BLOCK_N + j
+
+                if col < N:
+                    out[bx, col] = acc[j]
+
+    return hg_kernel
+
+@tilelang.jit
+def fused_cal_hg_dynamic_forward_v2(
+    M,              # n_edge
+    N,              # 3 * e_dim
+    E,              # e_dim
+    NO,             # num_owner
+    dtype="float32",
+    accum_dtype="float32",
+    BLOCK_N: int = 64,
+):
+    assert M % NO == 0
+    EDGES_PER_OWNER = M // NO
+
+    @T.prim_func
+    def hg_kernel(
+        flat_edge_ebd: T.Buffer((M, E), dtype),
+        flat_sw: T.Buffer((M,), dtype),
+        flat_h2: T.Buffer((M, 3), dtype),
+        scale_factor: T.float32,
+        out: T.Buffer((NO, N), accum_dtype),
+    ):
+        with T.Kernel(
+            NO,
+            T.ceildiv(N, BLOCK_N),
+            threads=64,
+        ) as (bx, by):
+
+            acc = T.alloc_fragment(
+                (BLOCK_N,),
+                accum_dtype,
+            )
+            T.clear(acc)
+
+            # ---------------------------------------------------------
+            # Optimization 2 ONLY:
+            # 不使用 shared memory
+            # 直接从 global memory 读取 sw / h2
+            #
+            # 但是将 reduction / index_add 逻辑手工展开
+            # ---------------------------------------------------------
+            for j in T.Parallel(BLOCK_N):
+                col = by * BLOCK_N + j
+
+                if col < N:
+                    h2_idx = col // E
+                    e_idx = col % E
+
+                    edge_base = bx * EDGES_PER_OWNER
+
+                    v0 = (
+                        flat_edge_ebd[edge_base + 0, e_idx]
+                        * flat_sw[edge_base + 0]
+                        * flat_h2[edge_base + 0, h2_idx]
+                    )
+
+                    v1 = (
+                        flat_edge_ebd[edge_base + 1, e_idx]
+                        * flat_sw[edge_base + 1]
+                        * flat_h2[edge_base + 1, h2_idx]
+                    )
+
+                    v2 = (
+                        flat_edge_ebd[edge_base + 2, e_idx]
+                        * flat_sw[edge_base + 2]
+                        * flat_h2[edge_base + 2, h2_idx]
+                    )
+
+                    v3 = (
+                        flat_edge_ebd[edge_base + 3, e_idx]
+                        * flat_sw[edge_base + 3]
+                        * flat_h2[edge_base + 3, h2_idx]
+                    )
+
+                    v4 = (
+                        flat_edge_ebd[edge_base + 4, e_idx]
+                        * flat_sw[edge_base + 4]
+                        * flat_h2[edge_base + 4, h2_idx]
+                    )
+
+                    v5 = (
+                        flat_edge_ebd[edge_base + 5, e_idx]
+                        * flat_sw[edge_base + 5]
+                        * flat_h2[edge_base + 5, h2_idx]
+                    )
+
+                    v6 = (
+                        flat_edge_ebd[edge_base + 6, e_idx]
+                        * flat_sw[edge_base + 6]
+                        * flat_h2[edge_base + 6, h2_idx]
+                    )
+
+                    v7 = (
+                        flat_edge_ebd[edge_base + 7, e_idx]
+                        * flat_sw[edge_base + 7]
+                        * flat_h2[edge_base + 7, h2_idx]
+                    )
+
+                    v8 = (
+                        flat_edge_ebd[edge_base + 8, e_idx]
+                        * flat_sw[edge_base + 8]
+                        * flat_h2[edge_base + 8, h2_idx]
+                    )
+
+                    v9 = (
+                        flat_edge_ebd[edge_base + 9, e_idx]
+                        * flat_sw[edge_base + 9]
+                        * flat_h2[edge_base + 9, h2_idx]
+                    )
+
+                    v10 = (
+                        flat_edge_ebd[edge_base + 10, e_idx]
+                        * flat_sw[edge_base + 10]
+                        * flat_h2[edge_base + 10, h2_idx]
+                    )
+
+                    acc[j] = (
+                        v0 + v1 + v2 + v3 + v4
+                        + v5 + v6 + v7 + v8 + v9 + v10
+                    ) * scale_factor
+
+            for j in T.Parallel(BLOCK_N):
+                col = by * BLOCK_N + j
+
+                if col < N:
+                    out[bx, col] = acc[j]
+
+    return hg_kernel
+
+@tilelang.jit
 def fused_cal_hg_dynamic_forward(
     M,  # n_edge
     N,  # 3 * e_dim
@@ -36,13 +319,13 @@ def fused_cal_hg_dynamic_forward(
                 edge_idx = bx * EDGES_PER_OWNER + r
                 meta_shared[r, k + 1] = flat_h2[edge_idx, k]
             
-            acc = T.alloc_fragment((BLOCK_N,), accum_dtype)
+            T.sync_threads()
 
+            acc = T.alloc_fragment((BLOCK_N,), accum_dtype)
             T.clear(acc)
 
             for j in T.Parallel(BLOCK_N):
                 col = by * BLOCK_N + j
-
                 if col < N:
                     h2_idx = col // E
                     e_idx = col % E
@@ -68,6 +351,58 @@ def fused_cal_hg_dynamic_forward(
                     out[bx, col] = acc[j]
 
     return hg_kernel
+
+@tilelang.jit
+def fused_call_grrg_forward_v0(
+    NB,     # nb
+    NLOC,   # nloc
+    E,      # e_dim
+    AXIS,   # axis_neuron
+    dtype="float32",
+    accum_dtype="float32",
+    BLOCK_M=4,
+    BLOCK_N=32,
+):
+    @T.prim_func
+    def grrg_kernel(
+        h2g2: T.Buffer((NB, NLOC, 3, E), dtype),
+        out: T.Buffer((NB, NLOC, AXIS * E), accum_dtype),
+    ):
+        NUM_TILE_M = T.ceildiv(AXIS, BLOCK_M)
+        NUM_TILE_N = T.ceildiv(E, BLOCK_N)
+
+        with T.Kernel(
+            NB,
+            NLOC,
+            NUM_TILE_M * NUM_TILE_N,
+            threads=128,
+        ) as (bx, by, bz):
+
+            tile_m = bz // NUM_TILE_N
+            tile_n = bz % NUM_TILE_N
+
+            for a, e in T.Parallel(BLOCK_M, BLOCK_N):
+                axis_idx = tile_m * BLOCK_M + a
+                e_idx = tile_n * BLOCK_N + e
+
+                if axis_idx < AXIS and e_idx < E:
+                    acc = T.alloc_var(accum_dtype, 0)
+
+                    for k in T.serial(3):
+                        acc += (
+                            h2g2[bx, by, k, axis_idx]
+                            * h2g2[bx, by, k, e_idx]
+                        )
+
+                    acc = acc / (3.0**1)
+
+                    out[
+                        bx,
+                        by,
+                        axis_idx * E + e_idx,
+                    ] = acc
+
+    return grrg_kernel
 
 @tilelang.jit
 def fused_call_grrg_forward(
@@ -139,7 +474,7 @@ class FusedSymmetrizationOpDynamic(torch.autograd.Function):
             dtype=flat_edge_ebd.dtype,
         )
 
-        hg_kernel = fused_cal_hg_dynamic_forward(M=n_edge, N=3*e_dim, E=e_dim, NO=num_owner)
+        hg_kernel = fused_cal_hg_dynamic_forward_v1(M=n_edge, N=3*e_dim, E=e_dim, NO=num_owner)
         hg_kernel(flat_edge_ebd, flat_sw, flat_h2, scale_factor, h2g2)
         h2g2 = h2g2.reshape(nb, nloc, 3, e_dim)
 
@@ -158,7 +493,7 @@ class FusedSymmetrizationOpDynamic(torch.autograd.Function):
             dtype=h2g2.dtype,
         )
 
-        grrg_kernel = fused_call_grrg_forward(NB=nb, NLOC=nloc, E=e_dim, AXIS=axis_neuron)
+        grrg_kernel = fused_call_grrg_forward_v0(NB=nb, NLOC=nloc, E=e_dim, AXIS=axis_neuron)
         grrg_kernel(h2g2, grrg)
 
         ctx.save_for_backward(
@@ -238,6 +573,11 @@ def fused_call_hg_dynamic_backward(
         grad_flat_sw: T.Buffer((M,), accum_dtype),
     ):
         with T.Kernel(M, threads=BLOCK_D) as (bx,):
+            sh_acc_h0 = T.alloc_shared((BLOCK_D,), T.float32)
+            sh_acc_h1 = T.alloc_shared((BLOCK_D,), T.float32)
+            sh_acc_h2 = T.alloc_shared((BLOCK_D,), T.float32)
+            sh_acc_sw = T.alloc_shared((BLOCK_D,), T.float32)
+
             m = bx
             tx = T.get_thread_binding()
 
@@ -282,11 +622,6 @@ def fused_call_hg_dynamic_backward(
             red_h2 = T.alloc_shared((1,), T.float32)
             red_sw = T.alloc_shared((1,), T.float32)
 
-            sh_acc_h0 = T.alloc_shared((BLOCK_D,), T.float32)
-            sh_acc_h1 = T.alloc_shared((BLOCK_D,), T.float32)
-            sh_acc_h2 = T.alloc_shared((BLOCK_D,), T.float32)
-            sh_acc_sw = T.alloc_shared((BLOCK_D,), T.float32)
-
             sh_acc_h0[tx] = acc_h0
             sh_acc_h1[tx] = acc_h1
             sh_acc_h2[tx] = acc_h2
@@ -324,52 +659,30 @@ def fused_call_grrg_backward(
         scale_factor: T.float32,
     ):
         with T.Kernel(NB * NLOC, threads=THREADS) as (bx,):
-            idx = bx
-            nb_idx = idx // NLOC
-            nloc_idx = idx % NLOC
+            nb_idx = bx // NLOC
+            nloc_idx = bx % NLOC
 
             sh_G = T.alloc_shared((A, E), dtype)
             sh_H = T.alloc_shared((3, E), dtype)
 
             sh_right_tmp = T.alloc_shared((3, E, A), dtype)
             sh_right = T.alloc_shared((3, E), dtype)
+
             sh_left_tmp = T.alloc_shared((3, A, E), dtype)
             sh_left = T.alloc_shared((3, A), dtype)
 
-            total_G = A * E
-            for linear in T.Parallel(total_G):
-                a = linear // E
-                e = linear % E
-
+            for a, e in T.Parallel(A, E):
                 sh_G[a, e] = grad_grrg[nb_idx, nloc_idx, a * E + e]
 
-            total_H = 3 * E
-            for linear in T.Parallel(total_H):
-                b = linear // E
-                e = linear % E
-
+            for b, e in T.Parallel(3, E):
                 sh_H[b, e] = h2g2[nb_idx, nloc_idx, b, e]
 
             T.sync_threads()
 
-            total_right_tmp = 3 * E * A
-            for linear in T.Parallel(total_right_tmp):
-                tmp = linear
-                b = tmp // (E * A)
-                rem = tmp % (E * A)
-                e = rem // A
-                a = rem % A
-
+            for b, e, a in T.Parallel(3, E, A):
                 sh_right_tmp[b, e, a] = sh_H[b, a] * sh_G[a, e]
 
-            total_left_tmp = 3 * A * E
-            for linear in T.Parallel(total_left_tmp):
-                tmp = linear
-                b = tmp // (A * E)
-                rem = tmp % (A * E)
-                a = rem // E
-                k = rem % E
-
+            for b, a, k in T.Parallel(3, A, E):
                 sh_left_tmp[b, a, k] = sh_H[b, k] * sh_G[a, k]
 
             T.sync_threads()
@@ -381,10 +694,7 @@ def fused_call_grrg_backward(
 
             scale = scale_factor / 3.0
 
-            total_out = 3 * E
-            for linear in T.Parallel(total_out):
-                b = linear // E
-                e = linear % E
+            for b, e in T.Parallel(3, E):
                 if e < A:
                     grad_h2g2[nb_idx, nloc_idx, b, e] = (sh_right[b, e] + sh_left[b, e]) * scale
                 else:
@@ -421,20 +731,8 @@ class FusedSymmetrizationOpDynamicBackward(torch.autograd.Function):
             dtype=grad_grrg.dtype,
             device=grad_grrg.device,
         )
-
-        grrg_backward_kernel = fused_call_grrg_backward(
-            NB=nb,
-            NLOC=nloc,
-            E=E,
-            A=axis_neuron,
-        )
-
-        grrg_backward_kernel(
-            grad_grrg,
-            h2g2,
-            grad_h2g2,
-            float(scale_factor),
-        )
+        grrg_backward_kernel = fused_call_grrg_backward(NB=nb, NLOC=nloc, E=E, A=axis_neuron)
+        grrg_backward_kernel(grad_grrg, h2g2, grad_h2g2, float(scale_factor))
 
         # grad_g1 = grad_grrg.reshape(nb, nloc, axis_neuron, E)
         # h2g2m = h2g2[..., :axis_neuron]
@@ -460,17 +758,8 @@ class FusedSymmetrizationOpDynamicBackward(torch.autograd.Function):
         grad_flat_sw = torch.empty_like(flat_sw)
 
         hg_backward_kernel = fused_call_hg_dynamic_backward(M=M, E=E, NB=nb, NLOC=nloc)
-        hg_backward_kernel(
-            grad_h2g2,
-            flat_edge_ebd,
-            flat_h2,
-            flat_sw,
-            owner,
-            grad_flat_h2g2,
-            grad_flat_edge_ebd,
-            grad_h2,
-            grad_flat_sw,
-        )
+        hg_backward_kernel(grad_h2g2, flat_edge_ebd, flat_h2, flat_sw, \
+            owner, grad_flat_h2g2, grad_flat_edge_ebd, grad_h2, grad_flat_sw)
 
         # grad_flat_h2g2 = grad_h2g2[0, owner, :, :]
 
@@ -827,10 +1116,9 @@ class FusedEdgeUpdateFunction(torch.autograd.Function):
         )
 
         out = torch.empty((n_edges, out_dim), device=node_ebd.device, dtype=node_ebd.dtype,)
-        # sub_node_update = torch.empty((n_edges, out_dim), device=node_ebd.device, dtype=node_ebd.dtype)
 
         edge_forward_kernel(node_ebd, node_ebd_ext, flat_edge_ebd, n2e_index,
-            n_ext2e_index, node, node_ext, edge, bias, out, # sub_node_update)
+            n_ext2e_index, node, node_ext, edge, bias, out)
 
         # torch.save(
         #     sub_node_update.detach().cpu(),
@@ -1679,6 +1967,263 @@ def fused_node_ext_backward_v3(
 
     return node_ext_backward
 
+@tilelang.jit
+def fused_edge_update_weight_backward_v1(
+    E,
+    K,
+    D_edge,
+    N_node,
+    D_node,
+    N_ext,
+    D_ext,
+    dtype="float32",
+    accum_dtype="float32",
+    BLOCK_E=32,
+    BLOCK_D=16,
+    BLOCK_K=32,
+):
+    MAX_D = max(D_edge, D_node, D_ext)
+
+    @T.prim_func
+    def weight_backward(
+        grad_out: T.Buffer((E, K), dtype),
+        flat_edge_ebd: T.Buffer((E, D_edge), dtype),
+        node_ebd: T.Buffer((N_node, D_node), dtype),
+        node_ebd_ext: T.Buffer((N_ext, D_ext), dtype),
+        n2e_index: T.Buffer((E,), "int64"),
+        n_ext2e_index: T.Buffer((E,), "int64"),
+        grad_edge_weight: T.Buffer((D_edge, K), accum_dtype),
+        grad_node_weight: T.Buffer((D_node, K), accum_dtype),
+        grad_node_ext_weight: T.Buffer((D_ext, K), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(MAX_D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=128) as (bx, by):
+            d_base = bx * BLOCK_D
+            k_base = by * BLOCK_K
+            grad_shared = T.alloc_shared((BLOCK_E, BLOCK_K), dtype)
+            feature_shared = T.alloc_shared((BLOCK_D, BLOCK_E), dtype)
+
+            grad_edge_weight_acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            grad_node_weight_acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            grad_node_ext_weight_acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.clear(grad_edge_weight_acc)
+            T.clear(grad_node_weight_acc)
+            T.clear(grad_node_ext_weight_acc)
+
+            for eo in T.serial(T.ceildiv(E, BLOCK_E)):
+                e_base = eo * BLOCK_E
+                for ei, ki in T.Parallel(BLOCK_E, BLOCK_K):
+                    e = e_base + ei
+                    k = k_base + ki
+                    if e < E and k < K:
+                        grad_shared[ei, ki] = grad_out[e, k]
+                    else:
+                        grad_shared[ei, ki] = 0.0
+
+                T.sync_threads()
+
+                for di, ei in T.Parallel(BLOCK_D, BLOCK_E):
+                    d = d_base + di
+                    e = e_base + ei
+                    if d < D_edge and e < E:
+                        feature_shared[di, ei] = flat_edge_ebd[e, d]
+                    else:
+                        feature_shared[di, ei] = 0.0
+
+                T.sync_threads()
+
+                if d_base < D_edge:
+                    T.gemm(feature_shared, grad_shared, grad_edge_weight_acc)
+
+                T.sync_threads()
+
+                for di, ei in T.Parallel(BLOCK_D, BLOCK_E):
+                    d = d_base + di
+                    e = e_base + ei
+                    if d < D_node and e < E:
+                        node_id = n2e_index[e]
+                        feature_shared[di, ei] = node_ebd[node_id, d]
+                    else:
+                        feature_shared[di, ei] = 0.0
+
+                T.sync_threads()
+
+                if d_base < D_node:
+                    T.gemm(feature_shared, grad_shared, grad_node_weight_acc)
+
+                T.sync_threads()
+
+                for di, ei in T.Parallel(BLOCK_D, BLOCK_E):
+                    d = d_base + di
+                    e = e_base + ei
+                    if d < D_ext and e < E:
+                        ext_id = n_ext2e_index[e]
+                        feature_shared[di, ei] = node_ebd_ext[ext_id, d]
+                    else:
+                        feature_shared[di, ei] = 0.0
+
+                T.sync_threads()
+
+                if d_base < D_ext:
+                    T.gemm(feature_shared, grad_shared, grad_node_ext_weight_acc)
+
+                T.sync_threads()
+
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = d_base + di
+                k = k_base + ki
+                if d < D_edge and k < K:
+                    grad_edge_weight[d, k] = grad_edge_weight_acc[di, ki]
+
+                if d < D_node and k < K:
+                    grad_node_weight[d, k] = grad_node_weight_acc[di, ki]
+
+                if d < D_ext and k < K:
+                    grad_node_ext_weight[d, k] = grad_node_ext_weight_acc[di, ki]
+
+    return weight_backward
+
+@tilelang.jit
+def fused_edge_update_input_backward_v1(
+    E,
+    K,
+    D_edge,
+    D_node,
+    D_ext,
+    N_node,
+    N_ext,
+    dtype="float32",
+    accum_dtype="float32",
+    BLOCK_E=32,
+    BLOCK_D=16,
+    BLOCK_K=32,
+):
+    MAX_D = max(D_edge, D_node, D_ext)
+
+    @T.prim_func
+    def input_backward(
+        grad_out: T.Buffer((E, K), dtype),
+        edge_weight: T.Buffer((D_edge, K), dtype),
+        node_weight: T.Buffer((D_node, K), dtype),
+        node_ext_weight: T.Buffer((D_ext, K), dtype),
+        n2e_index: T.Buffer((E,), "int64"),
+        n_ext2e_index: T.Buffer((E,), "int64"),
+        grad_edge_ebd: T.Buffer((E, D_edge), accum_dtype),
+        grad_node: T.Buffer((N_node, D_node), accum_dtype),
+        grad_node_ext: T.Buffer((N_ext, D_ext), accum_dtype),
+        grad_bias: T.Buffer((K,), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(E, BLOCK_E), T.ceildiv(MAX_D, BLOCK_D), threads=128) as (bx, by):
+            e_base = bx * BLOCK_E
+            d_base = by * BLOCK_D
+
+            grad_shared = T.alloc_shared((BLOCK_E, BLOCK_K), dtype)
+            weight_shared = T.alloc_shared((BLOCK_K, BLOCK_D), dtype)
+
+            grad_edge_acc = T.alloc_fragment((BLOCK_E, BLOCK_D), accum_dtype)
+            grad_node_acc = T.alloc_fragment((BLOCK_E, BLOCK_D), accum_dtype)
+            grad_node_ext_acc = T.alloc_fragment((BLOCK_E, BLOCK_D), accum_dtype)
+            bias_tile = T.alloc_fragment((BLOCK_K,), accum_dtype)
+            T.clear(grad_edge_acc)
+            T.clear(grad_node_acc)
+            T.clear(grad_node_ext_acc)
+            T.clear(bias_tile)
+
+            for ko in T.serial(T.ceildiv(K, BLOCK_K)):
+                k_base = ko * BLOCK_K
+                for ei, ki in T.Parallel(BLOCK_E, BLOCK_K):
+                    e = e_base + ei
+                    k = k_base + ki
+                    if e < E and k < K:
+                        grad_shared[ei, ki] = grad_out[e, k]
+                    else:
+                        grad_shared[ei, ki] = 0.0
+
+                T.sync_threads()
+
+                for ki, di in T.Parallel(BLOCK_K, BLOCK_D):
+                    k = k_base + ki
+                    d = d_base + di
+                    if k < K and d < D_edge:
+                        weight_shared[ki, di] = edge_weight[d, k]
+                    else:
+                        weight_shared[ki, di] = 0.0
+
+                T.sync_threads()
+
+                if d_base < D_edge:
+                    T.gemm(grad_shared, weight_shared, grad_edge_acc)
+
+                T.sync_threads()
+
+                for ki, di in T.Parallel(BLOCK_K, BLOCK_D):
+                    k = k_base + ki
+                    d = d_base + di
+                    if k < K and d < D_node:
+                        weight_shared[ki, di] = node_weight[d, k]
+                    else:
+                        weight_shared[ki, di] = 0.0
+
+                T.sync_threads()
+
+                if d_base < D_node:
+                    T.gemm(grad_shared, weight_shared, grad_node_acc)
+
+                T.sync_threads()
+
+                for ki, di in T.Parallel(BLOCK_K, BLOCK_D):
+                    k = k_base + ki
+                    d = d_base + di
+                    if k < K and d < D_ext:
+                        weight_shared[ki, di] = node_ext_weight[d, k]
+                    else:
+                        weight_shared[ki, di] = 0.0
+
+                T.sync_threads()
+
+                if d_base < D_ext:
+                    T.gemm(grad_shared, weight_shared, grad_node_ext_acc)
+
+                T.sync_threads()
+
+                if by == 0:
+                    for ki in T.Parallel(BLOCK_K):
+                        k = k_base + ki
+                        if k < K:
+                            for ei in T.serial(BLOCK_E):
+                                e = e_base + ei
+                                if e < E:
+                                    bias_tile[ki] += T.cast(grad_shared[ei, ki], accum_dtype)
+
+                    for ki in T.Parallel(BLOCK_K):
+                        k = k_base + ki
+                        if k < K:
+                            T.atomic_add(grad_bias[k], bias_tile[ki])
+
+            if d_base < D_edge:
+                for ei, di in T.Parallel(BLOCK_E, BLOCK_D):
+                    e = e_base + ei
+                    d = d_base + di
+                    if e < E and d < D_edge:
+                        grad_edge_ebd[e, d] = grad_edge_acc[ei, di]
+
+            if d_base < D_node:
+                for ei, di in T.Parallel(BLOCK_E, BLOCK_D):
+                    e = e_base + ei
+                    d = d_base + di
+                    if e < E and d < D_node:
+                        node_id = n2e_index[e]
+                        T.atomic_add(grad_node[node_id, d], grad_node_acc[ei, di])
+
+            if d_base < D_ext:
+                for ei, di in T.Parallel(BLOCK_E, BLOCK_D):
+                    e = e_base + ei
+                    d = d_base + di
+                    if e < E and d < D_ext:
+                        ext_id = n_ext2e_index[e]
+                        T.atomic_add(grad_node_ext[ext_id, d], grad_node_ext_acc[ei, di])
+
+    return input_backward
+
 class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1698,7 +2243,8 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
         N_node, D_node = node_ebd.shape
         N_ext, D_ext = node_ebd_ext.shape
         E_edge, D_edge = flat_edge_ebd.shape
-
+        
+        """
         grad_edge_ebd = grad_out @ edge_weight.T
         grad_edge_weight = flat_edge_ebd.T @ grad_out
 
@@ -1731,7 +2277,7 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
         )
         node_ext_weight_kernel = fused_node_ext_weight_backward_v4(E=E, N=N_ext, K=K, D=D_ext)
         node_ext_weight_kernel(node_ebd_ext, n_ext2e_index, grad_out, grad_node_ext_weight)
-        
+
         grad_node_ext = torch.zeros(
             (N_ext, D_ext),
             device=grad_out.device,
@@ -1744,6 +2290,93 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
 
         node_ext_kernel = fused_node_ext_backward_v3(E=E, K=K, D=D_ext, N=N_ext)
         node_ext_kernel(grad_out, node_ext_weight, n_ext2e_index, grad_node_ext, grad_bias)
+        """
+        grad_edge_weight = torch.empty(
+            (D_edge, K),
+            device=grad_out.device,
+            dtype=grad_out.dtype,
+        )
+
+        grad_node_weight = torch.empty(
+            (D_node, K),
+            device=grad_out.device,
+            dtype=grad_out.dtype,
+        )
+
+        grad_node_ext_weight = torch.empty(
+            (D_ext, K),
+            device=grad_out.device,
+            dtype=grad_out.dtype,
+        )
+
+        weight_kernel = fused_edge_update_weight_backward_v1(
+            E=E,
+            K=K,
+            D_edge=D_edge,
+            N_node=N_node,
+            D_node=D_node,
+            N_ext=N_ext,
+            D_ext=D_ext,
+        )
+
+        weight_kernel(
+            grad_out,
+            flat_edge_ebd,
+            node_ebd,
+            node_ebd_ext,
+            n2e_index,
+            n_ext2e_index,
+            grad_edge_weight,
+            grad_node_weight,
+            grad_node_ext_weight,
+        )
+
+        grad_edge_ebd = torch.empty(
+            (E, D_edge),
+            device=grad_out.device,
+            dtype=grad_out.dtype,
+        )
+
+        grad_node = torch.zeros(
+            (N_node, D_node),
+            device=grad_out.device,
+            dtype=grad_out.dtype,
+        )
+
+        grad_node_ext = torch.zeros(
+            (N_ext, D_ext),
+            device=grad_out.device,
+            dtype=grad_out.dtype,
+        )
+
+        grad_bias = torch.zeros(
+            (K,),
+            device=grad_out.device,
+            dtype=grad_out.dtype,
+        )
+
+        input_kernel = fused_edge_update_input_backward_v1(
+            E=E,
+            K=K,
+            D_edge=D_edge,
+            D_node=D_node,
+            D_ext=D_ext,
+            N_node=N_node,
+            N_ext=N_ext,
+        )
+
+        input_kernel(
+            grad_out,
+            edge_weight,
+            node_weight,
+            node_ext_weight,
+            n2e_index,
+            n_ext2e_index,
+            grad_edge_ebd,
+            grad_node,
+            grad_node_ext,
+            grad_bias,
+        )
 
         ctx.save_for_backward(
             grad_out,
@@ -1826,7 +2459,6 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
 
         if grad_grad_node_weight is not None:
             grad_gathered_node = grad_out @ grad_grad_node_weight.T
-
             grad_grad_node_ebd.index_add_(0, n2e_index, grad_gathered_node)
 
         grad_grad_node_ebd_ext = torch.zeros_like(node_ebd_ext)
@@ -2927,6 +3559,992 @@ def fused_edge_ik_ij_sub_backward_v1(
 
     return edge_sub_backward
 
+@tilelang.jit
+def fused_angle_node_angle_backward_big(
+    M,
+    A,
+    N,
+    K,
+    dtype="float32",
+    accum_dtype="float32",
+    BLOCK_M=32,
+    BLOCK_A=32,
+    BLOCK_N=32,
+    BLOCK_K=32,
+    THREADS=128,
+    NUM_STAGES=2,
+):
+    NUM_M = T.ceildiv(M, BLOCK_M)
+    NUM_A = T.ceildiv(A, BLOCK_A)
+    NUM_K = T.ceildiv(K, BLOCK_K)
+    NUM_N = T.ceildiv(N, BLOCK_N)
+
+    @T.prim_func
+    def kernel(
+        grad_output: T.Buffer((M, K), dtype),
+        flat_angle_ebd: T.Buffer((M, N), dtype),
+        flat_node_ebd: T.Buffer((A, N), dtype),
+        sub_angle: T.Buffer((N, K), dtype),
+        sub_node: T.Buffer((N, K), dtype),
+
+        node_start: T.Buffer((A,), "int32"),
+        node_count: T.Buffer((A,), "int32"),
+
+        grad_flat_angle_ebd: T.Buffer((M, A), dtype),
+        grad_flat_node_ebd: T.Buffer((A, N), dtype),
+        grad_sub_angle: T.Buffer((A, K), dtype),
+        grad_sub_node: T.Buffer((N, K), dtype),
+    ):
+        with T.Kernel(
+            NUM_M,
+            NUM_A,
+            threads=THREADS,
+        ) as (bx, by):
+
+            # ==================================================
+            # Shared memory
+            # ==================================================
+
+            # Persistent current grad_output tile.
+            shared_0 = T.alloc_shared(
+                (BLOCK_M, BLOCK_K),
+                dtype,
+            )
+
+            # Reusable scratch buffer.
+            #
+            # Maximum required shapes:
+            #
+            #   [BLOCK_A, BLOCK_K]  sub_angle
+            #   [BLOCK_M, BLOCK_A]  flat_angle
+            #   [BLOCK_N, BLOCK_K]  sub_node
+            #   [BLOCK_A, BLOCK_N]  flat_node
+            #
+            # Allocate a square-ish buffer large enough for all.
+            shared_operand = T.alloc_shared(
+                (
+                    max(BLOCK_M, BLOCK_A, BLOCK_N),
+                    max(BLOCK_A, BLOCK_K, BLOCK_N),
+                ),
+                dtype,
+            )
+
+            # Separate buffers for the two node paths.
+            shared_node_add = T.alloc_shared(
+                (BLOCK_A, BLOCK_K),
+                dtype,
+            )
+
+            shared_node_select = T.alloc_shared(
+                (BLOCK_A, BLOCK_K),
+                dtype,
+            )
+
+            # ==================================================
+            # Fragments
+            # ==================================================
+
+            # K reduction is accumulated in this fragment.
+            frag_flat_angle = T.alloc_fragment(
+                (BLOCK_M, BLOCK_A),
+                accum_dtype,
+            )
+
+            T.clear(frag_flat_angle)
+
+            # These are per-K-tile partial results.
+            frag_sub_angle = T.alloc_fragment(
+                (BLOCK_A, BLOCK_K),
+                accum_dtype,
+            )
+
+            frag_flat_node = T.alloc_fragment(
+                (BLOCK_A, BLOCK_N),
+                accum_dtype,
+            )
+
+            frag_sub_node = T.alloc_fragment(
+                (BLOCK_N, BLOCK_K),
+                accum_dtype,
+            )
+
+            # ==================================================
+            # K pipeline
+            # ==================================================
+
+            for tk in T.Pipelined(
+                NUM_K,
+                num_stages=NUM_STAGES,
+            ):
+                k0 = tk * BLOCK_K
+
+                # ==================================================
+                # 1. Cooperative load grad_output
+                #
+                # shared_0 remains the current grad_output tile
+                # and is reused by all following operations.
+                # ==================================================
+
+                for i, j in T.Parallel(
+                    BLOCK_M,
+                    BLOCK_K,
+                ):
+                    global_m = bx * BLOCK_M + i
+                    global_k = k0 + j
+
+                    if (
+                        global_m < M
+                        and global_k < K
+                    ):
+                        shared_0[i, j] = grad_output[
+                            global_m,
+                            global_k,
+                        ]
+                    else:
+                        shared_0[i, j] = 0
+
+                T.sync_threads()
+
+                # ==================================================
+                # 2. grad_flat_angle_ebd
+                #
+                # grad_flat_angle_ebd =
+                #
+                #     grad_output @ sub_angle.T
+                #
+                # [BM,BK] @ [BA,BK].T
+                #       -> [BM,BA]
+                #
+                # K is a reduction dimension, therefore the fragment
+                # is accumulated across T.Pipelined(K).
+                # ==================================================
+
+                for i, j in T.Parallel(
+                    BLOCK_A,
+                    BLOCK_K,
+                ):
+                    global_a = by * BLOCK_A + i
+                    global_k = k0 + j
+
+                    if (
+                        global_a < A
+                        and global_k < K
+                    ):
+                        shared_operand[i, j] = sub_angle[
+                            global_a,
+                            global_k,
+                        ]
+                    else:
+                        shared_operand[i, j] = 0
+
+                T.sync_threads()
+
+                T.gemm(
+                    shared_0,
+                    shared_operand,
+                    frag_flat_angle,
+                    transpose_A=False,
+                    transpose_B=True,
+                )
+
+                T.sync_threads()
+
+                # ==================================================
+                # 3. grad_sub_angle
+                #
+                # grad_sub_angle =
+                #
+                #     flat_angle.T @ grad_output
+                #
+                # [BA,BM] @ [BM,BK]
+                #       -> [BA,BK]
+                #
+                # M is the reduction dimension.
+                #
+                # Current bx owns only one M tile, so this is a
+                # partial result and needs atomic_add.
+                # ==================================================
+
+                for i, j in T.Parallel(
+                    BLOCK_M,
+                    BLOCK_A,
+                ):
+                    global_m = bx * BLOCK_M + i
+                    global_a = by * BLOCK_A + j
+
+                    if (
+                        global_m < M
+                        and global_a < A
+                    ):
+                        shared_operand[i, j] = flat_angle_ebd[
+                            global_m,
+                            global_a,
+                        ]
+                    else:
+                        shared_operand[i, j] = 0
+
+                T.sync_threads()
+
+                T.clear(frag_sub_angle)
+
+                T.gemm(
+                    shared_operand,
+                    shared_0,
+                    frag_sub_angle,
+                    transpose_A=True,
+                    transpose_B=False,
+                )
+
+                T.sync_threads()
+
+                for i, j in T.Parallel(
+                    BLOCK_A,
+                    BLOCK_K,
+                ):
+                    global_a = by * BLOCK_A + i
+                    global_k = k0 + j
+
+                    if (
+                        global_a < A
+                        and global_k < K
+                    ):
+                        T.atomic_add(
+                            grad_sub_angle[
+                                global_a,
+                                global_k,
+                            ],
+                            frag_sub_angle[i, j],
+                        )
+
+                T.sync_threads()
+
+                # ==================================================
+                # 4. node_grad_add
+                #
+                # This is the intermediate for:
+                #
+                #     grad_output @ sub_node.T
+                #     followed by index_add_
+                #
+                # Specifically:
+                #
+                # node_grad_add[a,k]
+                #
+                #     = sum_{m in node a} grad_output[m,k]
+                #
+                # IMPORTANT:
+                #
+                # This buffer is independent from
+                # shared_node_select.
+                # ==================================================
+
+                for i, j in T.Parallel(
+                    BLOCK_A,
+                    BLOCK_K,
+                ):
+                    global_a = by * BLOCK_A + i
+                    global_k = k0 + j
+
+                    acc = T.alloc_var(
+                        accum_dtype,
+                        init=0)
+
+                    if (
+                        global_a < A
+                        and global_k < K
+                    ):
+                        start = node_start[global_a]
+                        count = node_count[global_a]
+
+                        for m in T.serial(BLOCK_M):
+                            global_m = bx * BLOCK_M + m
+
+                            if (
+                                global_m >= start
+                                and global_m < start + count
+                                and global_m < M
+                            ):
+                                acc += shared_0[m, j]
+
+                    shared_node_add[i, j] = acc
+
+                T.sync_threads()
+
+                # ==================================================
+                # 5. grad_flat_node_ebd
+                #
+                # node_grad_add @ sub_node.T
+                #
+                # [BA,BK] @ [BN,BK].T
+                #       -> [BA,BN]
+                #
+                # We process N in tiles.
+                #
+                # The current K tile is a partial reduction, so
+                # every result is atomically accumulated.
+                # ==================================================
+
+                for tn in T.serial(NUM_N):
+                    n0 = tn * BLOCK_N
+
+                    for i, j in T.Parallel(
+                        BLOCK_N,
+                        BLOCK_K,
+                    ):
+                        global_n = n0 + i
+                        global_k = k0 + j
+
+                        if (
+                            global_n < N
+                            and global_k < K
+                        ):
+                            shared_operand[i, j] = sub_node[
+                                global_n,
+                                global_k,
+                            ]
+                        else:
+                            shared_operand[i, j] = 0
+
+                    T.sync_threads()
+
+                    T.clear(frag_flat_node)
+
+                    T.gemm(
+                        shared_node_add,
+                        shared_operand,
+                        frag_flat_node,
+                        transpose_A=False,
+                        transpose_B=True,
+                    )
+
+                    T.sync_threads()
+
+                    for i, j in T.Parallel(
+                        BLOCK_A,
+                        BLOCK_N,
+                    ):
+                        global_a = by * BLOCK_A + i
+                        global_n = n0 + j
+
+                        if (
+                            global_a < A
+                            and global_n < N
+                        ):
+                            T.atomic_add(
+                                grad_flat_node_ebd[
+                                    global_a,
+                                    global_n,
+                                ],
+                                frag_flat_node[i, j],
+                            )
+
+                    T.sync_threads()
+
+                # ==================================================
+                # 6. node_grad_select
+                #
+                # This is a separate logical path corresponding to:
+                #
+                #     gathered_node =
+                #         flat_node_ebd[n2a_index]
+                #
+                #     grad_sub_node =
+                #         gathered_node.T @ grad_output
+                #
+                # We do NOT reuse shared_node_add.
+                # ==================================================
+
+                for i, j in T.Parallel(
+                    BLOCK_A,
+                    BLOCK_K,
+                ):
+                    global_a = by * BLOCK_A + i
+                    global_k = k0 + j
+
+                    acc = T.alloc_var(
+                        accum_dtype,
+                        init=0,
+                    )
+
+                    if (
+                        global_a < A
+                        and global_k < K
+                    ):
+                        start = node_start[global_a]
+                        count = node_count[global_a]
+
+                        for m in T.serial(BLOCK_M):
+                            global_m = bx * BLOCK_M + m
+
+                            if (
+                                global_m >= start
+                                and global_m < start + count
+                                and global_m < M
+                            ):
+                                acc += shared_0[m, j]
+
+                    shared_node_select[i, j] = acc
+
+                T.sync_threads()
+
+                # ==================================================
+                # 7. grad_sub_node
+                #
+                # flat_node_ebd.T @ node_grad_select
+                #
+                # [BN,BA] @ [BA,BK]
+                #       -> [BN,BK]
+                #
+                # Current block is only one A tile and one M tile,
+                # so this is a partial result.
+                # ==================================================
+
+                for tn in T.serial(NUM_N):
+                    n0 = tn * BLOCK_N
+
+                    for i, j in T.Parallel(
+                        BLOCK_A,
+                        BLOCK_N,
+                    ):
+                        global_a = by * BLOCK_A + i
+                        global_n = n0 + j
+
+                        if (
+                            global_a < A
+                            and global_n < N
+                        ):
+                            shared_operand[i, j] = flat_node_ebd[
+                                global_a,
+                                global_n,
+                            ]
+                        else:
+                            shared_operand[i, j] = 0
+
+                    T.sync_threads()
+
+                    T.clear(frag_sub_node)
+
+                    T.gemm(
+                        shared_operand,
+                        shared_node_select,
+                        frag_sub_node,
+                        transpose_A=True,
+                        transpose_B=False,
+                    )
+
+                    T.sync_threads()
+
+                    for i, j in T.Parallel(
+                        BLOCK_N,
+                        BLOCK_K,
+                    ):
+                        global_n = n0 + i
+                        global_k = k0 + j
+
+                        if (
+                            global_n < N
+                            and global_k < K
+                        ):
+                            T.atomic_add(
+                                grad_sub_node[
+                                    global_n,
+                                    global_k,
+                                ],
+                                frag_sub_node[i, j],
+                            )
+
+                    T.sync_threads()
+
+            # ==================================================
+            # 8. grad_flat_angle_ebd
+            #
+            # K reduction is already complete.
+            #
+            # No atomic is necessary here because each
+            # (bx,by) owns a unique [M,A] output tile.
+            # ==================================================
+
+            for i, j in T.Parallel(
+                BLOCK_M,
+                BLOCK_A,
+            ):
+                global_m = bx * BLOCK_M + i
+                global_a = by * BLOCK_A + j
+
+                if (
+                    global_m < M
+                    and global_a < A
+                ):
+                    grad_flat_angle_ebd[
+                        global_m,
+                        global_a,
+                    ] = frag_flat_angle[i, j]
+
+    return kernel
+
+@tilelang.jit
+def fused_angle_edge_backward_big(
+    G,
+    N_EDGE,
+    E,
+    EK,
+    D,
+    max_group,
+    dtype="float32",
+    accum_dtype="float32",
+    BLOCK_G=32,
+    BLOCK_EK=32,
+    BLOCK_D=32,
+    THREADS=128,
+    NUM_STAGES=2,
+):
+    NUM_G = T.ceildiv(G, BLOCK_G)
+    NUM_EK = T.ceildiv(EK, BLOCK_EK)
+    NUM_D = T.ceildiv(D, BLOCK_D)
+
+    @T.prim_func
+    def kernel(
+        grad_output: T.Buffer((E, D), dtype),
+        sub_edge_ik: T.Buffer((EK, D), dtype),
+        sub_edge_ij: T.Buffer((EK, D), dtype),
+        flat_edge_ebd: T.Buffer((N_EDGE, EK), dtype),
+
+        target_ids: T.Buffer((G,), "int64"),
+        eik_pos: T.Buffer((G, max_group), "int64"),
+        eij_pos: T.Buffer((G, max_group), "int64"),
+        group_count: T.Buffer((G,), "int64"),
+
+        grad_flat_edge_ebd: T.Buffer((N_EDGE, EK), dtype),
+        grad_sub_edge_ik: T.Buffer((EK, D), dtype),
+        grad_sub_edge_ij: T.Buffer((EK, D), dtype),
+    ):
+        with T.Kernel(
+            NUM_G,
+            NUM_D,
+            threads=THREADS,
+        ) as (bg, bd):
+
+            # ==================================================
+            # Shared buffers
+            # ==================================================
+
+            # Current gathered/reduced grad_output.
+            #
+            # IK is processed first, then this exact buffer
+            # is overwritten by IJ.
+            shared_grad = T.alloc_shared(
+                (BLOCK_G, BLOCK_D),
+                dtype,
+            )
+
+            # Reusable operand buffer.
+            #
+            # Used for:
+            #   sub_edge_ik
+            #   flat_edge
+            #   sub_edge_ij
+            #
+            shared_operand = T.alloc_shared(
+                (
+                    max(BLOCK_G, BLOCK_EK),
+                    max(BLOCK_EK, BLOCK_D),
+                ),
+                dtype,
+            )
+
+            frag_flat_edge = T.alloc_fragment(
+                (BLOCK_G, BLOCK_EK),
+                accum_dtype,
+            )
+
+            frag_sub_edge = T.alloc_fragment(
+                (BLOCK_EK, BLOCK_D),
+                accum_dtype,
+            )
+
+            # ==================================================
+            # D pipeline
+            #
+            # D is the reduction dimension of:
+            #
+            #   grad_output @ sub_edge.T
+            #
+            # and output dimension of:
+            #
+            #   flat_edge.T @ gathered_grad
+            # ==================================================
+
+            for td in T.Pipelined(
+                NUM_D,
+                num_stages=NUM_STAGES,
+            ):
+                d0 = td * BLOCK_D
+
+                # ==================================================
+                # IK gather/reduction
+                # ==================================================
+
+                for g, d in T.Parallel(
+                    BLOCK_G,
+                    BLOCK_D,
+                ):
+                    global_g = bg * BLOCK_G + g
+                    global_d = d0 + d
+
+                    acc = T.alloc_var(
+                        accum_dtype,
+                        init=0,
+                    )
+
+                    if (
+                        global_g < G
+                        and global_d < D
+                    ):
+                        count = group_count[global_g]
+
+                        for p in T.serial(max_group):
+                            if p < count:
+                                pos = eik_pos[
+                                    global_g,
+                                    p,
+                                ]
+
+                                if (
+                                    pos >= 0
+                                    and pos < E
+                                ):
+                                    acc += grad_output[
+                                            pos,
+                                            global_d,
+                                        ]
+
+                    shared_grad[g, d] = acc
+
+                T.sync_threads()
+
+                # ==================================================
+                # IK -> grad_flat_edge
+                #
+                # gathered_grad_ik @ sub_edge_ik.T
+                #
+                # [BG,BD] @ [BEK,BD].T
+                #       -> [BG,BEK]
+                # ==================================================
+
+                for ek, d in T.Parallel(
+                    BLOCK_EK,
+                    BLOCK_D,
+                ):
+                    global_ek = bg * BLOCK_EK + ek
+                    global_d = d0 + d
+
+                    if (
+                        global_ek < EK
+                        and global_d < D
+                    ):
+                        shared_operand[ek, d] = sub_edge_ik[
+                            global_ek,
+                            global_d,
+                        ]
+                    else:
+                        shared_operand[ek, d] = 0
+
+                T.sync_threads()
+
+                T.clear(frag_flat_edge)
+
+                T.gemm(
+                    shared_grad,
+                    shared_operand,
+                    frag_flat_edge,
+                    transpose_A=False,
+                    transpose_B=True,
+                )
+
+                T.sync_threads()
+
+                for g, ek in T.Parallel(
+                    BLOCK_G,
+                    BLOCK_EK,
+                ):
+                    global_g = bg * BLOCK_G + g
+                    global_ek = bd * BLOCK_EK + ek
+
+                    if (
+                        global_g < G
+                        and global_ek < EK
+                    ):
+                        target = target_ids[global_g]
+
+                        if (
+                            target >= 0
+                            and target < N_EDGE
+                        ):
+                            T.atomic_add(
+                                grad_flat_edge_ebd[
+                                    target,
+                                    global_ek,
+                                ],
+                                frag_flat_edge[g, ek],
+                            )
+
+                T.sync_threads()
+
+                # ==================================================
+                # IK -> grad_sub_edge_ik
+                #
+                # flat_edge[target].T @ gathered_grad_ik
+                #
+                # [BEK,BG] @ [BG,BD]
+                #       -> [BEK,BD]
+                #
+                # G is reduction dimension.
+                # Current bg is one partial G tile.
+                # ==================================================
+
+                for g, ek in T.Parallel(
+                    BLOCK_G,
+                    BLOCK_EK,
+                ):
+                    global_g = bg * BLOCK_G + g
+                    global_ek = bd * BLOCK_EK + ek
+
+                    if (
+                        global_g < G
+                        and global_ek < EK
+                    ):
+                        target = target_ids[global_g]
+
+                        if (
+                            target >= 0
+                            and target < N_EDGE
+                        ):
+                            shared_operand[g, ek] = flat_edge_ebd[
+                                target,
+                                global_ek,
+                            ]
+                        else:
+                            shared_operand[g, ek] = 0
+                    else:
+                        shared_operand[g, ek] = 0
+
+                T.sync_threads()
+
+                T.clear(frag_sub_edge)
+
+                T.gemm(
+                    shared_operand,
+                    shared_grad,
+                    frag_sub_edge,
+                    transpose_A=True,
+                    transpose_B=False,
+                )
+
+                T.sync_threads()
+
+                for ek, d in T.Parallel(
+                    BLOCK_EK,
+                    BLOCK_D,
+                ):
+                    global_ek = bg * BLOCK_EK + ek
+                    global_d = d0 + d
+
+                    if (
+                        global_ek < EK
+                        and global_d < D
+                    ):
+                        T.atomic_add(
+                            grad_sub_edge_ik[
+                                global_ek,
+                                global_d,
+                            ],
+                            frag_sub_edge[ek, d],
+                        )
+
+                T.sync_threads()
+
+                # ==================================================
+                # IMPORTANT:
+                #
+                # shared_grad is now free to be overwritten.
+                #
+                # We DO NOT keep both IK and IJ gathered results.
+                # ==================================================
+
+                # ==================================================
+                # IJ gather/reduction
+                # ==================================================
+
+                for g, d in T.Parallel(
+                    BLOCK_G,
+                    BLOCK_D,
+                ):
+                    global_g = bg * BLOCK_G + g
+                    global_d = d0 + d
+
+                    acc = T.alloc_var(
+                        accum_dtype,
+                        init=0,
+                    )
+
+                    if (
+                        global_g < G
+                        and global_d < D
+                    ):
+                        count = group_count[global_g]
+
+                        for p in T.serial(max_group):
+                            if p < count:
+                                pos = eij_pos[
+                                    global_g,
+                                    p,
+                                ]
+
+                                if (
+                                    pos >= 0
+                                    and pos < E
+                                ):
+                                    acc += grad_output[
+                                            pos,
+                                            global_d,
+                                        ]
+
+                    shared_grad[g, d] = acc
+
+                T.sync_threads()
+
+                # ==================================================
+                # IJ -> grad_flat_edge
+                #
+                # gathered_grad_ij @ sub_edge_ij.T
+                # ==================================================
+
+                for ek, d in T.Parallel(
+                    BLOCK_EK,
+                    BLOCK_D,
+                ):
+                    global_ek = bg * BLOCK_EK + ek
+                    global_d = d0 + d
+
+                    if (
+                        global_ek < EK
+                        and global_d < D
+                    ):
+                        shared_operand[ek, d] = sub_edge_ij[
+                            global_ek,
+                            global_d,
+                        ]
+                    else:
+                        shared_operand[ek, d] = 0
+
+                T.sync_threads()
+
+                T.clear(frag_flat_edge)
+
+                T.gemm(
+                    shared_grad,
+                    shared_operand,
+                    frag_flat_edge,
+                    transpose_A=False,
+                    transpose_B=True,
+                )
+
+                T.sync_threads()
+
+                for g, ek in T.Parallel(
+                    BLOCK_G,
+                    BLOCK_EK,
+                ):
+                    global_g = bg * BLOCK_G + g
+                    global_ek = bk * BLOCK_EK + ek
+
+                    if (
+                        global_g < G
+                        and global_ek < EK
+                    ):
+                        target = target_ids[global_g]
+
+                        if (
+                            target >= 0
+                            and target < N_EDGE
+                        ):
+                            T.atomic_add(
+                                grad_flat_edge_ebd[
+                                    target,
+                                    global_ek,
+                                ],
+                                frag_flat_edge[g, ek],
+                            )
+
+                T.sync_threads()
+
+                # ==================================================
+                # IJ -> grad_sub_edge_ij
+                # ==================================================
+
+                for g, ek in T.Parallel(
+                    BLOCK_G,
+                    BLOCK_EK,
+                ):
+                    global_g = bg * BLOCK_G + g
+                    global_ek = bk * BLOCK_EK + ek
+
+                    if (
+                        global_g < G
+                        and global_ek < EK
+                    ):
+                        target = target_ids[global_g]
+
+                        if (
+                            target >= 0
+                            and target < N_EDGE
+                        ):
+                            shared_operand[g, ek] = flat_edge_ebd[
+                                target,
+                                global_ek,
+                            ]
+                        else:
+                            shared_operand[g, ek] = 0
+                    else:
+                        shared_operand[g, ek] = 0
+
+                T.sync_threads()
+
+                T.clear(frag_sub_edge)
+
+                T.gemm(
+                    shared_operand,
+                    shared_grad,
+                    frag_sub_edge,
+                    transpose_A=True,
+                    transpose_B=False,
+                )
+
+                T.sync_threads()
+
+                for ek, d in T.Parallel(
+                    BLOCK_EK,
+                    BLOCK_D,
+                ):
+                    global_ek = bg * BLOCK_EK + ek
+                    global_d = d0 + d
+
+                    if (
+                        global_ek < EK
+                        and global_d < D
+                    ):
+                        T.atomic_add(
+                            grad_sub_edge_ij[
+                                global_ek,
+                                global_d,
+                            ],
+                            frag_sub_edge[ek, d],
+                        )
+
+                T.sync_threads()
+
+    return kernel
+
 class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
     _target_ids = None
     _eik_pos = None
@@ -2951,7 +4569,8 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, \
             torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         grad_output = grad_output.contiguous()
-
+        
+        """
         M, K = grad_output.shape
         A, N = flat_node_ebd.shape
 
@@ -2967,16 +4586,15 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
             dtype=torch.int32,
             device=grad_output.device,
         )
-
         node_count = torch.tensor(
             [121, 121, 121, 121, 121, 121,
              64, 64, 64, 64, 64, 64],
             dtype=torch.int32,
             device=grad_output.device,
         )
+
         node_backward = fused_angle_node_backward_v3_1(M=M, N=N, K=K, A=A)
         node_backward(grad_output, sub_node, node_start, node_count, grad_flat_node_ebd)
-
         grad_node_ebd = grad_flat_node_ebd.reshape(node_ebd_shape)
         
         grad_flat_edge_ebd = torch.zeros(flat_edge_ebd.shape, device=grad_output.device, dtype=grad_output.dtype)
@@ -3005,7 +4623,7 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
         IK = sub_edge_ik.shape[0]
         N_EDGE, EK = flat_edge_ebd.shape
         max_group = eik_pos.shape[1]
-
+        
         edge_backward = fused_edge_ik_ij_backward_v3(G=G, N=N_EDGE, E=M, K=IK, D=K, max_group=max_group)
         edge_backward(grad_output, sub_edge_ik, sub_edge_ij, target_ids, \
             eik_pos, eij_pos, group_count, grad_flat_edge_ebd)
@@ -3029,6 +4647,200 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
         edge_sub_backward = fused_edge_ik_ij_sub_backward_v1(G=G, N=N_EDGE, E=M, K=EK, D=K, max_group=max_group)
         edge_sub_backward(flat_edge_ebd, grad_output, target_ids, eik_pos, \
                 eij_pos, group_count, grad_sub_edge_ik, grad_sub_edge_ij)
+
+        grad_bias = grad_output.sum(dim=0)
+        """
+
+        M, K = grad_output.shape
+
+        A, N = flat_node_ebd.shape
+
+        N_EDGE, EK = flat_edge_ebd.shape
+
+        # ========================================================
+        # Node metadata
+        # ========================================================
+
+        node_start = torch.tensor(
+            [
+                0, 121, 242, 363, 484, 605,
+                726, 790, 854, 918, 982, 1046,
+            ],
+            dtype=torch.int32,
+            device=grad_output.device,
+        )
+
+        node_count = torch.tensor(
+            [
+                121, 121, 121, 121, 121, 121,
+                64, 64, 64, 64, 64, 64,
+            ],
+            dtype=torch.int32,
+            device=grad_output.device,
+        )
+
+        # ========================================================
+        # Allocate outputs
+        #
+        # The big kernels use atomic_add, so outputs must start
+        # from zero.
+        # ========================================================
+
+        grad_flat_angle_ebd = torch.zeros(
+            (M, A),
+            device=grad_output.device,
+            dtype=grad_output.dtype,
+        )
+
+        grad_flat_node_ebd = torch.zeros(
+            (A, N),
+            device=grad_output.device,
+            dtype=grad_output.dtype,
+        )
+
+        grad_sub_angle = torch.zeros(
+            (A, K),
+            device=grad_output.device,
+            dtype=grad_output.dtype,
+        )
+
+        grad_sub_node = torch.zeros(
+            (N, K),
+            device=grad_output.device,
+            dtype=grad_output.dtype,
+        )
+
+        # ========================================================
+        # BIG KERNEL #1
+        #
+        #   grad_flat_angle_ebd
+        #   grad_flat_node_ebd
+        #   grad_sub_angle
+        #   grad_sub_node
+        # ========================================================
+
+        angle_node_kernel = fused_angle_node_angle_backward_big(
+            M=M,
+            A=A,
+            N=N,
+            K=K,
+        )
+
+        angle_node_kernel(
+            grad_output,
+            flat_angle_ebd,
+            flat_node_ebd,
+            sub_angle,
+            sub_node,
+            node_start,
+            node_count,
+            grad_flat_angle_ebd,
+            grad_flat_node_ebd,
+            grad_sub_angle,
+            grad_sub_node,
+        )
+
+        grad_node_ebd = grad_flat_node_ebd.reshape(
+            node_ebd_shape
+        )
+
+        # ========================================================
+        # Edge metadata
+        # ========================================================
+
+        if FusedAngleUpdateFunctionBackward._target_ids is None:
+            (
+                FusedAngleUpdateFunctionBackward._target_ids,
+                FusedAngleUpdateFunctionBackward._eik_pos,
+                FusedAngleUpdateFunctionBackward._eij_pos,
+                FusedAngleUpdateFunctionBackward._group_count,
+            ) = build_edge_backward_metadata(
+                eik2a_index,
+                eij2a_index,
+            )
+
+        target_ids = (
+            FusedAngleUpdateFunctionBackward._target_ids
+        )
+
+        eik_pos = (
+            FusedAngleUpdateFunctionBackward._eik_pos
+        )
+
+        eij_pos = (
+            FusedAngleUpdateFunctionBackward._eij_pos
+        )
+
+        group_count = (
+            FusedAngleUpdateFunctionBackward._group_count
+        )
+
+        G = target_ids.numel()
+
+        max_group = eik_pos.shape[1]
+
+        # ========================================================
+        # Edge outputs
+        # ========================================================
+
+        grad_flat_edge_ebd = torch.zeros(
+            (N_EDGE, EK),
+            device=grad_output.device,
+            dtype=grad_output.dtype,
+        )
+
+        grad_sub_edge_ik = torch.zeros(
+            (EK, K),
+            device=grad_output.device,
+            dtype=grad_output.dtype,
+        )
+
+        grad_sub_edge_ij = torch.zeros(
+            (EK, K),
+            device=grad_output.device,
+            dtype=grad_output.dtype,
+        )
+
+        # ========================================================
+        # BIG KERNEL #2
+        #
+        #   grad_flat_edge_ebd
+        #   grad_sub_edge_ik
+        #   grad_sub_edge_ij
+        # ========================================================
+
+        edge_kernel = fused_angle_edge_backward_big(
+            G=G,
+            N_EDGE=N_EDGE,
+            E=M,
+            EK=EK,
+            D=K,
+            max_group=max_group,
+            dtype=str(grad_output.dtype).replace(
+                "torch.",
+                "",
+            ),
+            accum_dtype="float32",
+            BLOCK_G=32,
+            BLOCK_EK=32,
+            BLOCK_D=32,
+            THREADS=128,
+            NUM_STAGES=2,
+        )
+
+        edge_kernel(
+            grad_output,
+            sub_edge_ik,
+            sub_edge_ij,
+            flat_edge_ebd,
+            target_ids,
+            eik_pos,
+            eij_pos,
+            group_count,
+            grad_flat_edge_ebd,
+            grad_sub_edge_ik,
+            grad_sub_edge_ij,
+        )
 
         grad_bias = grad_output.sum(dim=0)
 

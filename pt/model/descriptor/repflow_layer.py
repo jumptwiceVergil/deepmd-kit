@@ -652,7 +652,7 @@ class RepFlowLayer(torch.nn.Module):
             matrix, bias = self.angle_self_linear.matrix, self.angle_self_linear.bias
         else:
             raise NotImplementedError
-
+        
         nf, nloc, node_dim = node_ebd.shape
         edge_dim = flat_edge_ebd.shape[-1]
         angle_dim = flat_angle_ebd.shape[-1]
@@ -773,6 +773,7 @@ class RepFlowLayer(torch.nn.Module):
         else:
             raise NotImplementedError
         assert bias is not None
+
         nf, nall, node_dim = node_ebd_ext.shape
         _, nloc, _ = node_ebd.shape
         edge_dim = flat_edge_ebd.shape[-1]
