@@ -791,6 +791,35 @@ def fused_call_grrg_backward(
 
 
 @tilelang.jit
+def fused_call_grrg_backward_general(NB, NLOC, E, A, dtype="float32", THREADS=128):
+    """Gram VJP without cross-thread reductions for arbitrary feature sizes.
+
+    R[b,d] = scale/3 * (sum_a H[b,a] G[a,d]
+                        + (d < A) sum_k H[b,k] G[d,k]).
+    Each output has one writer, avoiding the XOR all-reduce width constraint.
+    """
+    @T.prim_func
+    def kernel(
+        grad_grrg: T.Buffer((NB, NLOC, A * E), dtype),
+        h2g2: T.Buffer((NB, NLOC, 3, E), dtype),
+        grad_h2g2: T.Buffer((NB, NLOC, 3, E), dtype),
+        scale_factor: T.float32,
+    ):
+        with T.Kernel(NB * NLOC, threads=THREADS) as (owner_idx,):
+            batch = owner_idx // NLOC
+            loc = owner_idx % NLOC
+            for b, d in T.Parallel(3, E):
+                acc = T.alloc_var(dtype, init=0)
+                for a in T.serial(A):
+                    acc += h2g2[batch, loc, b, a] * grad_grrg[batch, loc, a * E + d]
+                if d < A:
+                    for k in T.serial(E):
+                        acc += h2g2[batch, loc, b, k] * grad_grrg[batch, loc, d * E + k]
+                grad_h2g2[batch, loc, b, d] = acc * (scale_factor / 3.0)
+    return kernel
+
+
+@tilelang.jit
 def fused_symmetrization_double_backward_owner(
     M,
     E,
@@ -1050,7 +1079,15 @@ class FusedSymmetrizationOpDynamicBackward(torch.autograd.Function):
             dtype=grad_grrg.dtype,
             device=grad_grrg.device,
         )
-        grrg_backward_kernel = fused_call_grrg_backward(NB=nb, NLOC=nloc, E=E, A=axis_neuron)
+        # Original unconditional dispatch:
+        # grrg_backward_kernel = fused_call_grrg_backward(NB=nb, NLOC=nloc, E=E, A=axis_neuron)
+        # Non-power-of-two reduction extents can produce an unsupported
+        # XOR-butterfly width in TileLang (e.g. E=5, A=3).
+        regular_extents = (E > 0 and (E & (E - 1)) == 0
+                           and axis_neuron > 0 and (axis_neuron & (axis_neuron - 1)) == 0)
+        grrg_factory = (fused_call_grrg_backward if regular_extents
+                        else fused_call_grrg_backward_general)
+        grrg_backward_kernel = grrg_factory(NB=nb, NLOC=nloc, E=E, A=axis_neuron)
         grrg_backward_kernel(grad_grrg, h2g2, grad_h2g2, float(scale_factor))
 
         # grad_g1 = grad_grrg.reshape(nb, nloc, axis_neuron, E)

@@ -5,6 +5,7 @@ and TileLang and compare forward, VJP, and double VJP with native PyTorch.
 """
 import ast
 import importlib.util
+from itertools import product
 from pathlib import Path
 import unittest
 
@@ -80,12 +81,13 @@ class KernelTests(unittest.TestCase):
         torch.backends.cuda.matmul.allow_tf32 = False
 
     def test_forward_first_and_second_gradients(self):
-        for values in ([0, 0, 1, 1, 2, 2], [0, 1, 1, 2, 2, 2],
-                       [0, 0, 1, 2, 2], [2, 0, 2, 1, 2, 1], [0, 0, 2], []):
-            with self.subTest(owner=values):
+        layouts = ([0, 0, 1, 1, 2, 2], [0, 1, 1, 2, 2, 2],
+                   [0, 0, 1, 2, 2], [2, 0, 2, 1, 2, 1], [0, 0, 2], [])
+        for values, (e, a) in product(layouts, ((5, 3), (64, 4), (128, 4))):
+            with self.subTest(owner=values, E=e, A=a):
                 torch.manual_seed(31)
                 owner = torch.tensor(values, device="cuda", dtype=torch.int64)
-                m, e, a, o, scale = len(values), 5, 3, 3, .37
+                m, o, scale = len(values), 3, .37
                 inputs = [torch.randn(shape, device="cuda", requires_grad=True)
                           for shape in ((m, e), (m, 3), (m,))]
                 x, h, sw = inputs
