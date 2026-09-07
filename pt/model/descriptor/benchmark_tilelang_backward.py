@@ -93,7 +93,8 @@ def make_case(args, op, layer_cls, fused_classes):
         if nb != 1:
             raise ValueError("sym backward currently requires --batch 1")
         edge, h, sw = rand(ne, de), rand(ne, 3), rand(ne)
-        scale = args.neighbors ** -.5
+        normalization = args.sym_normalization if args.sym_normalization is not None else args.neighbors
+        scale = normalization ** -.5
         layer._cal_hg_dynamic = layer_cls._cal_hg_dynamic
         layer._cal_grrg = layer_cls._cal_grrg
         y = layer_cls.symmetrization_op_dynamic(
@@ -109,7 +110,8 @@ def make_case(args, op, layer_cls, fused_classes):
                 upstream, edge, h, sw, owners, H, nb, nl, nn, scale, args.axis)
 
         normalize = lambda result: result
-        sizes = {"edges": ne, "owners": nn, "edge_dim": de, "axis": args.axis}
+        sizes = {"edges": ne, "owners": nn, "edge_dim": de, "axis": args.axis,
+                 "scale_factor": scale}
     elif op == "edge":
         node, node_ext, edge = rand(nb, nl, dn), rand(nb, nx, dn), rand(ne, de)
         k = args.edge_out_dim
@@ -134,9 +136,11 @@ def make_case(args, op, layer_cls, fused_classes):
     else:
         # Construct all ordered (j,k) pairs within each owner's angle neighbors.
         an = args.angle_neighbors
-        ni = torch.arange(nn, device=device).repeat_interleave(an * an)
-        local_j = torch.arange(an, device=device).repeat_interleave(an).repeat(nn)
-        local_k = torch.arange(an, device=device).repeat(an).repeat(nn)
+        counts = args.angle_counts if args.angle_counts is not None else [an] * nn
+        ni = torch.cat([torch.full((count * count,), owner, device=device, dtype=torch.int64)
+                        for owner, count in enumerate(counts)])
+        local_j = torch.cat([torch.arange(count, device=device).repeat_interleave(count) for count in counts])
+        local_k = torch.cat([torch.arange(count, device=device).repeat(count) for count in counts])
         ij, ik = ni * args.neighbors + local_j, ni * args.neighbors + local_k
         ma = ni.numel()
         angle, node, edge = rand(ma, da), rand(nb, nl, dn), rand(ne, de)
@@ -175,6 +179,10 @@ def main():
     parser.add_argument("--nall", type=int, default=160)
     parser.add_argument("--neighbors", type=int, default=16)
     parser.add_argument("--angle-neighbors", type=int, default=8)
+    parser.add_argument("--angle-counts", type=int, nargs="+",
+                        help="Optional per-owner angle neighbor counts, in flattened batch order")
+    parser.add_argument("--sym-normalization", type=float,
+                        help="Sym scale is this value ** -0.5; for the supplied config use 120")
     parser.add_argument("--node-dim", type=int, default=128)
     parser.add_argument("--edge-dim", type=int, default=16)
     parser.add_argument("--angle-dim", type=int, default=64)
@@ -194,6 +202,13 @@ def main():
             parser.error(f"--{name.replace('_', '-')} must be positive")
     if args.axis > args.edge_dim or args.angle_neighbors > args.neighbors or args.nall < args.nloc:
         parser.error("Require axis <= edge-dim, angle-neighbors <= neighbors, nall >= nloc")
+    if args.sym_normalization is not None and args.sym_normalization <= 0:
+        parser.error("--sym-normalization must be positive")
+    if args.angle_counts is not None:
+        if (len(args.angle_counts) != args.batch * args.nloc
+                or any(c < 0 or c > args.neighbors for c in args.angle_counts)
+                or sum(args.angle_counts) == 0):
+            parser.error("--angle-counts needs batch*nloc counts in [0, neighbors], with at least one nonzero")
     if not torch.cuda.is_available():
         parser.error("A CUDA-enabled PyTorch installation and GPU are required")
     # Delay project/TileLang imports so --help works without either installed.
