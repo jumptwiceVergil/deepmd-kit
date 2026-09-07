@@ -60,13 +60,13 @@ def _sym_owner_metadata(owner, num_owner):
 def fused_cal_hg_dynamic_forward_segmented(M, E, NO, BLOCK_N=64):
     @T.prim_func
     def kernel(
-        edge: T.Buffer((M, E), "float32"),
-        sw: T.Buffer((M,), "float32"),
-        h: T.Buffer((M, 3), "float32"),
-        offsets: T.Buffer((NO + 1,), "int64"),
-        order: T.Buffer((M,), "int64"),
+        edge: T.Tensor((M, E), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        h: T.Tensor((M, 3), "float32"),
+        offsets: T.Tensor((NO + 1,), "int64"),
+        order: T.Tensor((M,), "int64"),
         scale: T.float32,
-        out: T.Buffer((NO, 3 * E), "float32"),
+        out: T.Tensor((NO, 3 * E), "float32"),
     ):
         with T.Kernel(NO, T.ceildiv(3 * E, BLOCK_N), threads=64) as (o, tile):
             for j in T.Parallel(BLOCK_N):
@@ -94,11 +94,11 @@ def fused_cal_hg_dynamic_forward_v0(
 
     @T.prim_func
     def hg_kernel(
-        flat_edge_ebd: T.Buffer((M, E), dtype),
-        flat_sw: T.Buffer((M,), dtype),
-        flat_h2: T.Buffer((M, 3), dtype),
+        flat_edge_ebd: T.Tensor((M, E), dtype),
+        flat_sw: T.Tensor((M,), dtype),
+        flat_h2: T.Tensor((M, 3), dtype),
         scale_factor: T.float32,
-        out: T.Buffer((NO, N), accum_dtype),
+        out: T.Tensor((NO, N), accum_dtype),
     ):
         with T.Kernel(
             NO,
@@ -162,11 +162,11 @@ def fused_cal_hg_dynamic_forward_v1(
 
     @T.prim_func
     def hg_kernel(
-        flat_edge_ebd: T.Buffer((M, E), dtype),
-        flat_sw: T.Buffer((M,), dtype),
-        flat_h2: T.Buffer((M, 3), dtype),
+        flat_edge_ebd: T.Tensor((M, E), dtype),
+        flat_sw: T.Tensor((M,), dtype),
+        flat_h2: T.Tensor((M, 3), dtype),
         scale_factor: T.float32,
-        out: T.Buffer((NO, N), accum_dtype),
+        out: T.Tensor((NO, N), accum_dtype),
     ):
         with T.Kernel(
             NO,
@@ -249,11 +249,11 @@ def fused_cal_hg_dynamic_forward_v2(
 
     @T.prim_func
     def hg_kernel(
-        flat_edge_ebd: T.Buffer((M, E), dtype),
-        flat_sw: T.Buffer((M,), dtype),
-        flat_h2: T.Buffer((M, 3), dtype),
+        flat_edge_ebd: T.Tensor((M, E), dtype),
+        flat_sw: T.Tensor((M,), dtype),
+        flat_h2: T.Tensor((M, 3), dtype),
         scale_factor: T.float32,
-        out: T.Buffer((NO, N), accum_dtype),
+        out: T.Tensor((NO, N), accum_dtype),
     ):
         with T.Kernel(
             NO,
@@ -377,11 +377,11 @@ def fused_cal_hg_dynamic_forward(
 
     @T.prim_func
     def hg_kernel(
-        flat_edge_ebd: T.Buffer((M, E), dtype),
-        flat_sw: T.Buffer((M,), dtype),
-        flat_h2: T.Buffer((M, 3), dtype),
+        flat_edge_ebd: T.Tensor((M, E), dtype),
+        flat_sw: T.Tensor((M,), dtype),
+        flat_h2: T.Tensor((M, 3), dtype),
         scale_factor: T.float32,
-        out: T.Buffer((NO, N), accum_dtype),
+        out: T.Tensor((NO, N), accum_dtype),
     ):
         with T.Kernel(NO, T.ceildiv(N, BLOCK_N), threads=64) as (bx, by):
             meta_shared = T.alloc_shared((EDGES_PER_OWNER, 4), dtype)
@@ -442,8 +442,8 @@ def fused_call_grrg_forward_v0(
 ):
     @T.prim_func
     def grrg_kernel(
-        h2g2: T.Buffer((NB, NLOC, 3, E), dtype),
-        out: T.Buffer((NB, NLOC, AXIS * E), accum_dtype),
+        h2g2: T.Tensor((NB, NLOC, 3, E), dtype),
+        out: T.Tensor((NB, NLOC, AXIS * E), accum_dtype),
     ):
         NUM_TILE_M = T.ceildiv(AXIS, BLOCK_M)
         NUM_TILE_N = T.ceildiv(E, BLOCK_N)
@@ -494,8 +494,8 @@ def fused_call_grrg_forward(
 ):
     @T.prim_func
     def grrg_kernel(
-        h2g2: T.Buffer((NB, NLOC, 3, E), dtype),
-        out: T.Buffer((NB, NLOC, AXIS * E), accum_dtype),
+        h2g2: T.Tensor((NB, NLOC, 3, E), dtype),
+        out: T.Tensor((NB, NLOC, AXIS * E), accum_dtype),
     ):
         NUM_TILE_M = T.ceildiv(AXIS, BLOCK_M)
         NUM_TILE_N = T.ceildiv(E, BLOCK_N)
@@ -649,15 +649,15 @@ def fused_call_hg_dynamic_backward(
 ):
     @T.prim_func
     def hg_backward(
-        grad_h2g2: T.Buffer((NB, NLOC, 3, E), dtype),
-        flat_edge_ebd: T.Buffer((M, E), dtype),
-        flat_h2: T.Buffer((M, 3), dtype),
-        flat_sw: T.Buffer((M,), dtype),
-        owner: T.Buffer((M,), "int64"),
-        grad_flat_h2g2: T.Buffer((M, 3, E), accum_dtype),
-        grad_flat_edge_ebd: T.Buffer((M, E), accum_dtype),
-        grad_h2: T.Buffer((M, 3), accum_dtype),
-        grad_flat_sw: T.Buffer((M,), accum_dtype),
+        grad_h2g2: T.Tensor((NB, NLOC, 3, E), dtype),
+        flat_edge_ebd: T.Tensor((M, E), dtype),
+        flat_h2: T.Tensor((M, 3), dtype),
+        flat_sw: T.Tensor((M,), dtype),
+        owner: T.Tensor((M,), "int64"),
+        grad_flat_h2g2: T.Tensor((M, 3, E), accum_dtype),
+        grad_flat_edge_ebd: T.Tensor((M, E), accum_dtype),
+        grad_h2: T.Tensor((M, 3), accum_dtype),
+        grad_flat_sw: T.Tensor((M,), accum_dtype),
     ):
         with T.Kernel(M, threads=BLOCK_D) as (bx,):
             sh_acc_h0 = T.alloc_shared((BLOCK_D,), T.float32)
@@ -740,9 +740,9 @@ def fused_call_grrg_backward(
 ):
     @T.prim_func
     def grrg_backward(
-        grad_grrg: T.Buffer((NB, NLOC, A * E), dtype),
-        h2g2: T.Buffer((NB, NLOC, 3, E), dtype),
-        grad_h2g2: T.Buffer((NB, NLOC, 3, E), dtype),
+        grad_grrg: T.Tensor((NB, NLOC, A * E), dtype),
+        h2g2: T.Tensor((NB, NLOC, 3, E), dtype),
+        grad_h2g2: T.Tensor((NB, NLOC, 3, E), dtype),
         scale_factor: T.float32,
     ):
         with T.Kernel(NB * NLOC, threads=THREADS) as (bx,):
@@ -800,9 +800,9 @@ def fused_call_grrg_backward_general(NB, NLOC, E, A, dtype="float32", THREADS=12
     """
     @T.prim_func
     def kernel(
-        grad_grrg: T.Buffer((NB, NLOC, A * E), dtype),
-        h2g2: T.Buffer((NB, NLOC, 3, E), dtype),
-        grad_h2g2: T.Buffer((NB, NLOC, 3, E), dtype),
+        grad_grrg: T.Tensor((NB, NLOC, A * E), dtype),
+        h2g2: T.Tensor((NB, NLOC, 3, E), dtype),
+        grad_h2g2: T.Tensor((NB, NLOC, 3, E), dtype),
         scale_factor: T.float32,
     ):
         with T.Kernel(NB * NLOC, threads=THREADS) as (owner_idx,):
@@ -835,17 +835,17 @@ def fused_symmetrization_double_backward_owner(
 
     @T.prim_func
     def double_backward_owner(
-        grad_grrg: T.Buffer((1, NO, A * E), dtype),
-        h2g2: T.Buffer((1, NO, 3, E), dtype),
-        flat_edge_ebd: T.Buffer((M, E), dtype),
-        flat_h2: T.Buffer((M, 3), dtype),
-        flat_sw: T.Buffer((M,), dtype),
-        grad_grad_edge: T.Buffer((M, E), dtype),
-        grad_grad_h2: T.Buffer((M, 3), dtype),
-        grad_grad_sw: T.Buffer((M,), dtype),
+        grad_grrg: T.Tensor((1, NO, A * E), dtype),
+        h2g2: T.Tensor((1, NO, 3, E), dtype),
+        flat_edge_ebd: T.Tensor((M, E), dtype),
+        flat_h2: T.Tensor((M, 3), dtype),
+        flat_sw: T.Tensor((M,), dtype),
+        grad_grad_edge: T.Tensor((M, E), dtype),
+        grad_grad_h2: T.Tensor((M, 3), dtype),
+        grad_grad_sw: T.Tensor((M,), dtype),
         scale_factor: T.float32,
-        grad_grad_grrg: T.Buffer((1, NO, A * E), accum_dtype),
-        grad_h2g2: T.Buffer((1, NO, 3, E), accum_dtype),
+        grad_grad_grrg: T.Tensor((1, NO, A * E), accum_dtype),
+        grad_h2g2: T.Tensor((1, NO, 3, E), accum_dtype),
     ):
         with T.Kernel(NO, threads=THREADS) as (owner_idx,):
             grad_q = T.alloc_shared((3, E), accum_dtype)
@@ -906,19 +906,19 @@ def fused_symmetrization_double_backward_edge(
 
     @T.prim_func
     def double_backward_edge(
-        grad_flat_h2g2: T.Buffer((M, 3, E), dtype),
-        grad_h2g2: T.Buffer((1, NO, 3, E), dtype),
-        flat_edge_ebd: T.Buffer((M, E), dtype),
-        flat_h2: T.Buffer((M, 3), dtype),
-        flat_sw: T.Buffer((M,), dtype),
-        owner: T.Buffer((M,), "int64"),
-        grad_grad_edge: T.Buffer((M, E), dtype),
-        grad_grad_h2: T.Buffer((M, 3), dtype),
-        grad_grad_sw: T.Buffer((M,), dtype),
+        grad_flat_h2g2: T.Tensor((M, 3, E), dtype),
+        grad_h2g2: T.Tensor((1, NO, 3, E), dtype),
+        flat_edge_ebd: T.Tensor((M, E), dtype),
+        flat_h2: T.Tensor((M, 3), dtype),
+        flat_sw: T.Tensor((M,), dtype),
+        owner: T.Tensor((M,), "int64"),
+        grad_grad_edge: T.Tensor((M, E), dtype),
+        grad_grad_h2: T.Tensor((M, 3), dtype),
+        grad_grad_sw: T.Tensor((M,), dtype),
         scale_factor: T.float32,
-        grad_flat_edge_ebd: T.Buffer((M, E), accum_dtype),
-        grad_flat_h2: T.Buffer((M, 3), accum_dtype),
-        grad_flat_sw: T.Buffer((M,), accum_dtype),
+        grad_flat_edge_ebd: T.Tensor((M, E), accum_dtype),
+        grad_flat_h2: T.Tensor((M, 3), accum_dtype),
+        grad_flat_sw: T.Tensor((M,), accum_dtype),
     ):
         with T.Kernel(M, threads=THREADS) as (edge_idx,):
             owner_idx = owner[edge_idx]
@@ -988,19 +988,19 @@ def fused_symmetrization_double_backward_owner_segmented(
 
     @T.prim_func
     def double_backward_owner(
-        grad_grrg: T.Buffer((1, NO, A * E), dtype),
-        h2g2: T.Buffer((1, NO, 3, E), dtype),
-        flat_edge_ebd: T.Buffer((M, E), dtype),
-        flat_h2: T.Buffer((M, 3), dtype),
-        flat_sw: T.Buffer((M,), dtype),
-        grad_grad_edge: T.Buffer((M, E), dtype),
-        grad_grad_h2: T.Buffer((M, 3), dtype),
-        grad_grad_sw: T.Buffer((M,), dtype),
-        offsets: T.Buffer((NO + 1,), "int64"),
-        order: T.Buffer((M,), "int64"),
+        grad_grrg: T.Tensor((1, NO, A * E), dtype),
+        h2g2: T.Tensor((1, NO, 3, E), dtype),
+        flat_edge_ebd: T.Tensor((M, E), dtype),
+        flat_h2: T.Tensor((M, 3), dtype),
+        flat_sw: T.Tensor((M,), dtype),
+        grad_grad_edge: T.Tensor((M, E), dtype),
+        grad_grad_h2: T.Tensor((M, 3), dtype),
+        grad_grad_sw: T.Tensor((M,), dtype),
+        offsets: T.Tensor((NO + 1,), "int64"),
+        order: T.Tensor((M,), "int64"),
         scale_factor: T.float32,
-        grad_grad_grrg: T.Buffer((1, NO, A * E), accum_dtype),
-        grad_h2g2: T.Buffer((1, NO, 3, E), accum_dtype),
+        grad_grad_grrg: T.Tensor((1, NO, A * E), accum_dtype),
+        grad_h2g2: T.Tensor((1, NO, 3, E), accum_dtype),
     ):
         with T.Kernel(NO, threads=THREADS) as (owner_idx,):
             grad_q = T.alloc_shared((3, E), accum_dtype)
@@ -1344,17 +1344,17 @@ def fused_edge_update_forward(
 ):
     @T.prim_func
     def kernel(
-        node_ebd: T.Buffer((N_NODES_LOC, NODE_DIM), "float32"),
-        node_ebd_ext: T.Buffer((N_NODES_EXT, NODE_DIM), "float32"),
-        flat_edge_ebd: T.Buffer((N_EDGES, EDGE_DIM), "float32"),
-        n2e_index: T.Buffer((N_EDGES,), "int64"),
-        n_ext2e_index: T.Buffer((N_EDGES,), "int64"),
-        node: T.Buffer((NODE_DIM, OUT_DIM), "float32"),
-        node_ext: T.Buffer((NODE_DIM, OUT_DIM), "float32"),
-        edge: T.Buffer((EDGE_DIM, OUT_DIM), "float32"),
-        bias: T.Buffer((OUT_DIM,), "float32"),
-        out: T.Buffer((N_EDGES, OUT_DIM), "float32"),
-        # sub_node_update: T.Buffer((N_EDGES, OUT_DIM), "float32"),
+        node_ebd: T.Tensor((N_NODES_LOC, NODE_DIM), "float32"),
+        node_ebd_ext: T.Tensor((N_NODES_EXT, NODE_DIM), "float32"),
+        flat_edge_ebd: T.Tensor((N_EDGES, EDGE_DIM), "float32"),
+        n2e_index: T.Tensor((N_EDGES,), "int64"),
+        n_ext2e_index: T.Tensor((N_EDGES,), "int64"),
+        node: T.Tensor((NODE_DIM, OUT_DIM), "float32"),
+        node_ext: T.Tensor((NODE_DIM, OUT_DIM), "float32"),
+        edge: T.Tensor((EDGE_DIM, OUT_DIM), "float32"),
+        bias: T.Tensor((OUT_DIM,), "float32"),
+        out: T.Tensor((N_EDGES, OUT_DIM), "float32"),
+        # sub_node_update: T.Tensor((N_EDGES, OUT_DIM), "float32"),
     ):
 
         with T.Kernel(T.ceildiv(N_EDGES, BLK_M), T.ceildiv(OUT_DIM, BLK_N), threads=128) as (bx, by):
@@ -1454,13 +1454,13 @@ def fused_edge_update_backward(
 ):
     @T.prim_func
     def kernel(
-        grad_out: T.Buffer((E, K), dtype),
-        node_weight: T.Buffer((D, K), dtype),
-        node_ext_weight: T.Buffer((D, K), dtype),
-        n2e_index: T.Buffer((E,), T.int64),
-        n_ext2e_index: T.Buffer((E,), T.int64),
-        grad_node: T.Buffer((NODE, D), accum_dtype),
-        grad_node_ext: T.Buffer((NODE, D), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        node_weight: T.Tensor((D, K), dtype),
+        node_ext_weight: T.Tensor((D, K), dtype),
+        n2e_index: T.Tensor((E,), T.int64),
+        n_ext2e_index: T.Tensor((E,), T.int64),
+        grad_node: T.Tensor((NODE, D), accum_dtype),
+        grad_node_ext: T.Tensor((NODE, D), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(D, block_N), T.ceildiv(E, block_M), threads=128,) as (bx, by):
             grad_out_shared = T.alloc_shared((block_M, block_K), dtype)
@@ -1617,10 +1617,10 @@ def fused_node_weight_backward_v1(
 ):
     @T.prim_func
     def node_weight_backward(
-        grad_out: T.Buffer((E, K), dtype),
-        node_ebd: T.Buffer((N, D), dtype),
-        n2e_index: T.Buffer((E,), "int64"),
-        grad_node_weight: T.Buffer((D, K), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        node_ebd: T.Tensor((N, D), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        grad_node_weight: T.Tensor((D, K), accum_dtype),
     ):
 
         with T.Kernel(D, K, threads=128) as (bx, by):
@@ -1653,10 +1653,10 @@ def fused_node_weight_backward_v2(
 ):
     @T.prim_func
     def node_weight_backward(
-        grad_out: T.Buffer((E, K), dtype),
-        node_ebd: T.Buffer((N, D), dtype),
-        n2e_index: T.Buffer((E,), "int64"),
-        grad_node_weight: T.Buffer((D, K), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        node_ebd: T.Tensor((N, D), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        grad_node_weight: T.Tensor((D, K), accum_dtype),
     ):
 
         with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=128) as (bx, by):
@@ -1699,10 +1699,10 @@ def fused_node_weight_backward_v3(
 
     @T.prim_func
     def node_weight_backward(
-        grad_out: T.Buffer((E, K), dtype),
-        node_ebd: T.Buffer((N, D), dtype),
-        n2e_index: T.Buffer((E,), "int64"),
-        grad_node_weight: T.Buffer((D, K), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        node_ebd: T.Tensor((N, D), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        grad_node_weight: T.Tensor((D, K), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=128) as (bx, by):
             acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
@@ -1745,10 +1745,10 @@ def fused_node_weight_backward_v4(
 
     @T.prim_func
     def node_weight_backward(
-        grad_out: T.Buffer((E, K), dtype),
-        node_ebd: T.Buffer((N, D), dtype),
-        n2e_index: T.Buffer((E,), "int64"),
-        grad_node_weight: T.Buffer((D, K), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        node_ebd: T.Tensor((N, D), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        grad_node_weight: T.Tensor((D, K), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=128) as (bx, by):
             node_shared = T.alloc_shared((BLOCK_D,), dtype)
@@ -1808,10 +1808,10 @@ def fused_node_backward_v1(
 ):
     @T.prim_func
     def node_backward(
-        grad_out: T.Buffer((E, K), dtype),
-        n2e_index: T.Buffer((E,), "int64"),
-        node_weight: T.Buffer((D, K), dtype),
-        grad_node: T.Buffer((N, D), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        node_weight: T.Tensor((D, K), dtype),
+        grad_node: T.Tensor((N, D), accum_dtype),
     ):
 
         with T.Kernel(N, D, threads=128) as (bx, by):
@@ -1848,10 +1848,10 @@ def fused_node_backward_v2(
 
     @T.prim_func
     def node_backward(
-        grad_out: T.Buffer((E, K), dtype),
-        n2e_index: T.Buffer((E,), "int64"),
-        node_weight: T.Buffer((D, K), dtype),
-        grad_node: T.Buffer((N, D), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        node_weight: T.Tensor((D, K), dtype),
+        grad_node: T.Tensor((N, D), accum_dtype),
     ):
         with T.Kernel(N, T.ceildiv(D, 1), threads=128) as (bx, by):
             node_id = bx
@@ -1887,10 +1887,10 @@ def fused_node_backward_v3(
 
     @T.prim_func
     def node_backward(
-        grad_out: T.Buffer((E, K), dtype),
-        n2e_index: T.Buffer((E,), "int64"),
-        node_weight: T.Buffer((D, K), dtype),
-        grad_node: T.Buffer((N, D), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        node_weight: T.Tensor((D, K), dtype),
+        grad_node: T.Tensor((N, D), accum_dtype),
     ):
         with T.Kernel(N, D, threads=128) as (bx, by):
             node_id = bx
@@ -1924,10 +1924,10 @@ def fused_node_backward_v4(
 
     @T.prim_func
     def node_backward(
-        grad_out: T.Buffer((E, K), dtype),
-        n2e_index: T.Buffer((E,), "int64"),
-        node_weight: T.Buffer((D, K), dtype),
-        grad_node: T.Buffer((N, D), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        node_weight: T.Tensor((D, K), dtype),
+        grad_node: T.Tensor((N, D), accum_dtype),
     ):
         with T.Kernel(N, D, threads=128) as (bx, by):
             node_id = bx
@@ -1966,10 +1966,10 @@ def fused_node_backward_v5(
 
     @T.prim_func
     def node_backward(
-        grad_out: T.Buffer((E, K), dtype),
-        n2e_index: T.Buffer((E,), "int64"),
-        node_weight: T.Buffer((D, K), dtype),
-        grad_node: T.Buffer((N, D), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        node_weight: T.Tensor((D, K), dtype),
+        grad_node: T.Tensor((N, D), accum_dtype),
     ):
         with T.Kernel(N, T.ceildiv(D, BLOCK_D), threads=128) as (bx, by):
             node_id = bx
@@ -2035,10 +2035,10 @@ def fused_node_ext_weight_backward(
 ):
     @T.prim_func
     def node_ext_weight_backward(
-        node_ebd_ext: T.Buffer((N, D), dtype),
-        n_ext2e_index: T.Buffer((E,), "int64"),
-        grad_out: T.Buffer((E, K), dtype),
-        grad_node_ext_weight: T.Buffer((D, K), accum_dtype),
+        node_ebd_ext: T.Tensor((N, D), dtype),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        grad_out: T.Tensor((E, K), dtype),
+        grad_node_ext_weight: T.Tensor((D, K), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=128) as (bx, by):
             acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
@@ -2077,10 +2077,10 @@ def fused_node_ext_weight_backward_v2(
 ):
     @T.prim_func
     def node_ext_weight_backward(
-        node_ebd_ext: T.Buffer((N, D), dtype),
-        n_ext2e_index: T.Buffer((E,), "int64"),
-        grad_out: T.Buffer((E, K), dtype),
-        grad_node_ext_weight: T.Buffer((D, K), accum_dtype),
+        node_ebd_ext: T.Tensor((N, D), dtype),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        grad_out: T.Tensor((E, K), dtype),
+        grad_node_ext_weight: T.Tensor((D, K), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=128) as (bx, by):
             node_shared = T.alloc_shared((N, BLOCK_D), dtype)
@@ -2126,10 +2126,10 @@ def fused_node_ext_weight_backward_v3(
 ):
     @T.prim_func
     def node_ext_weight_backward(
-        node_ebd_ext: T.Buffer((N, D), dtype),
-        n_ext2e_index: T.Buffer((E,), "int64"),
-        grad_out: T.Buffer((E, K), dtype),
-        grad_node_ext_weight: T.Buffer((D, K), accum_dtype),
+        node_ebd_ext: T.Tensor((N, D), dtype),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        grad_out: T.Tensor((E, K), dtype),
+        grad_node_ext_weight: T.Tensor((D, K), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=128) as (bx, by):
             node_shared = T.alloc_shared((N, BLOCK_D), dtype)
@@ -2185,10 +2185,10 @@ def fused_node_ext_weight_backward_v4(
 
     @T.prim_func
     def node_ext_weight_backward(
-        node_ebd_ext: T.Buffer((N, D), dtype),
-        n_ext2e_index: T.Buffer((E,), "int64"),
-        grad_out: T.Buffer((E, K), dtype),
-        grad_node_ext_weight: T.Buffer((D, K), accum_dtype),
+        node_ebd_ext: T.Tensor((N, D), dtype),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        grad_out: T.Tensor((E, K), dtype),
+        grad_node_ext_weight: T.Tensor((D, K), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=128) as (bx, by):
             d_start = bx * BLOCK_D
@@ -2240,10 +2240,10 @@ def fused_node_ext_backward_v1(
 ):
     @T.prim_func
     def node_ext_backward(
-        grad_out: T.Buffer((E, K), dtype),
-        node_ext_weight: T.Buffer((D, K), dtype),
-        n_ext2e_index: T.Buffer((E,), "int64"),
-        grad_node_ext: T.Buffer((N, D), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        node_ext_weight: T.Tensor((D, K), dtype),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        grad_node_ext: T.Tensor((N, D), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(E, BLOCK_E), T.ceildiv(D, BLOCK_D), threads=128) as (bx, by):
             grad_out_shared = T.alloc_shared((BLOCK_E, BLOCK_K), dtype)
@@ -2293,10 +2293,10 @@ def fused_node_ext_backward_v2(
 ):
     @T.prim_func
     def node_ext_backward(
-        grad_out: T.Buffer((E, K), dtype),
-        node_ext_weight: T.Buffer((D, K), dtype),
-        n_ext2e_index: T.Buffer((E,), "int64"),
-        grad_node_ext: T.Buffer((N, D), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        node_ext_weight: T.Tensor((D, K), dtype),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        grad_node_ext: T.Tensor((N, D), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(E, BLOCK_E), T.ceildiv(D, BLOCK_D), threads=128) as (bx, by):
             grad_out_shared = T.alloc_shared((BLOCK_E, BLOCK_K), dtype)
@@ -2347,11 +2347,11 @@ def fused_node_ext_backward_v3(
 ):
     @T.prim_func
     def node_ext_backward(
-        grad_out: T.Buffer((E, K), dtype),
-        node_ext_weight: T.Buffer((D, K), dtype),
-        n_ext2e_index: T.Buffer((E,), "int64"),
-        grad_node_ext: T.Buffer((N, D), accum_dtype),
-        grad_bias: T.Buffer((K,), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        node_ext_weight: T.Tensor((D, K), dtype),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        grad_node_ext: T.Tensor((N, D), accum_dtype),
+        grad_bias: T.Tensor((K,), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(E, BLOCK_E), T.ceildiv(D, BLOCK_D), threads=128) as (bx, by):
             grad_out_shared = T.alloc_shared((BLOCK_E, BLOCK_K), dtype)
@@ -2419,15 +2419,15 @@ def fused_edge_update_weight_backward_v1(
 
     @T.prim_func
     def weight_backward(
-        grad_out: T.Buffer((E, K), dtype),
-        flat_edge_ebd: T.Buffer((E, D_edge), dtype),
-        node_ebd: T.Buffer((N_node, D_node), dtype),
-        node_ebd_ext: T.Buffer((N_ext, D_ext), dtype),
-        n2e_index: T.Buffer((E,), "int64"),
-        n_ext2e_index: T.Buffer((E,), "int64"),
-        grad_edge_weight: T.Buffer((D_edge, K), accum_dtype),
-        grad_node_weight: T.Buffer((D_node, K), accum_dtype),
-        grad_node_ext_weight: T.Buffer((D_ext, K), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        flat_edge_ebd: T.Tensor((E, D_edge), dtype),
+        node_ebd: T.Tensor((N_node, D_node), dtype),
+        node_ebd_ext: T.Tensor((N_ext, D_ext), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        grad_edge_weight: T.Tensor((D_edge, K), accum_dtype),
+        grad_node_weight: T.Tensor((D_node, K), accum_dtype),
+        grad_node_ext_weight: T.Tensor((D_ext, K), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(MAX_D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=128) as (bx, by):
             d_base = bx * BLOCK_D
@@ -2534,16 +2534,16 @@ def fused_edge_update_input_backward_v1(
 
     @T.prim_func
     def input_backward(
-        grad_out: T.Buffer((E, K), dtype),
-        edge_weight: T.Buffer((D_edge, K), dtype),
-        node_weight: T.Buffer((D_node, K), dtype),
-        node_ext_weight: T.Buffer((D_ext, K), dtype),
-        n2e_index: T.Buffer((E,), "int64"),
-        n_ext2e_index: T.Buffer((E,), "int64"),
-        grad_edge_ebd: T.Buffer((E, D_edge), accum_dtype),
-        grad_node: T.Buffer((N_node, D_node), accum_dtype),
-        grad_node_ext: T.Buffer((N_ext, D_ext), accum_dtype),
-        grad_bias: T.Buffer((K,), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        edge_weight: T.Tensor((D_edge, K), dtype),
+        node_weight: T.Tensor((D_node, K), dtype),
+        node_ext_weight: T.Tensor((D_ext, K), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        grad_edge_ebd: T.Tensor((E, D_edge), accum_dtype),
+        grad_node: T.Tensor((N_node, D_node), accum_dtype),
+        grad_node_ext: T.Tensor((N_ext, D_ext), accum_dtype),
+        grad_bias: T.Tensor((K,), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(E, BLOCK_E), T.ceildiv(MAX_D, BLOCK_D), threads=128) as (bx, by):
             e_base = bx * BLOCK_E
@@ -2675,26 +2675,26 @@ def fused_edge_update_double_backward_inputs(
 
     @T.prim_func
     def double_backward_inputs(
-        grad_out: T.Buffer((E, K), dtype),
-        node_ebd: T.Buffer((N_node, D_node), dtype),
-        node_ebd_ext: T.Buffer((N_ext, D_ext), dtype),
-        flat_edge_ebd: T.Buffer((E, D_edge), dtype),
-        n2e_index: T.Buffer((E,), "int64"),
-        n_ext2e_index: T.Buffer((E,), "int64"),
-        node_weight: T.Buffer((D_node, K), dtype),
-        node_ext_weight: T.Buffer((D_ext, K), dtype),
-        edge_weight: T.Buffer((D_edge, K), dtype),
-        grad_grad_node: T.Buffer((N_node, D_node), dtype),
-        grad_grad_node_ext: T.Buffer((N_ext, D_ext), dtype),
-        grad_grad_edge_ebd: T.Buffer((E, D_edge), dtype),
-        grad_grad_node_weight: T.Buffer((D_node, K), dtype),
-        grad_grad_node_ext_weight: T.Buffer((D_ext, K), dtype),
-        grad_grad_edge_weight: T.Buffer((D_edge, K), dtype),
-        grad_grad_bias: T.Buffer((K,), dtype),
-        grad_grad_out: T.Buffer((E, K), accum_dtype),
-        grad_node_ebd: T.Buffer((N_node, D_node), accum_dtype),
-        grad_node_ebd_ext: T.Buffer((N_ext, D_ext), accum_dtype),
-        grad_flat_edge_ebd: T.Buffer((E, D_edge), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        node_ebd: T.Tensor((N_node, D_node), dtype),
+        node_ebd_ext: T.Tensor((N_ext, D_ext), dtype),
+        flat_edge_ebd: T.Tensor((E, D_edge), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        node_weight: T.Tensor((D_node, K), dtype),
+        node_ext_weight: T.Tensor((D_ext, K), dtype),
+        edge_weight: T.Tensor((D_edge, K), dtype),
+        grad_grad_node: T.Tensor((N_node, D_node), dtype),
+        grad_grad_node_ext: T.Tensor((N_ext, D_ext), dtype),
+        grad_grad_edge_ebd: T.Tensor((E, D_edge), dtype),
+        grad_grad_node_weight: T.Tensor((D_node, K), dtype),
+        grad_grad_node_ext_weight: T.Tensor((D_ext, K), dtype),
+        grad_grad_edge_weight: T.Tensor((D_edge, K), dtype),
+        grad_grad_bias: T.Tensor((K,), dtype),
+        grad_grad_out: T.Tensor((E, K), accum_dtype),
+        grad_node_ebd: T.Tensor((N_node, D_node), accum_dtype),
+        grad_node_ebd_ext: T.Tensor((N_ext, D_ext), accum_dtype),
+        grad_flat_edge_ebd: T.Tensor((E, D_edge), accum_dtype),
     ):
         with T.Kernel(E, threads=THREADS) as (edge_idx,):
             node_idx = n2e_index[edge_idx]
@@ -2761,15 +2761,15 @@ def fused_edge_update_double_backward_weights(
 
     @T.prim_func
     def double_backward_weights(
-        grad_out: T.Buffer((E, K), dtype),
-        n2e_index: T.Buffer((E,), "int64"),
-        n_ext2e_index: T.Buffer((E,), "int64"),
-        grad_grad_node: T.Buffer((N_node, D_node), dtype),
-        grad_grad_node_ext: T.Buffer((N_ext, D_ext), dtype),
-        grad_grad_edge_ebd: T.Buffer((E, D_edge), dtype),
-        grad_node_weight: T.Buffer((D_node, K), accum_dtype),
-        grad_node_ext_weight: T.Buffer((D_ext, K), accum_dtype),
-        grad_edge_weight: T.Buffer((D_edge, K), accum_dtype),
+        grad_out: T.Tensor((E, K), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        grad_grad_node: T.Tensor((N_node, D_node), dtype),
+        grad_grad_node_ext: T.Tensor((N_ext, D_ext), dtype),
+        grad_grad_edge_ebd: T.Tensor((E, D_edge), dtype),
+        grad_node_weight: T.Tensor((D_node, K), accum_dtype),
+        grad_node_ext_weight: T.Tensor((D_ext, K), accum_dtype),
+        grad_edge_weight: T.Tensor((D_edge, K), accum_dtype),
     ):
         with T.Kernel(
             T.ceildiv(MAX_D, BLOCK_D),
@@ -3181,18 +3181,18 @@ def fused_angle_update_forward(
 ):
     @T.prim_func
     def fused_angle_update(
-        flat_angle_ebd: T.Buffer((N_ANGLE, ANGLE_DIM), "float32"),
-        node_ebd: T.Buffer((N_NODE, NODE_DIM), "float32"),
-        flat_edge_ebd: T.Buffer((N_EDGE, EDGE_DIM), "float32"),
-        n2a_index: T.Buffer((N_ANGLE,), "int64"),
-        eij2a_index: T.Buffer((N_ANGLE,), "int64"),
-        eik2a_index: T.Buffer((N_ANGLE,), "int64"),
-        angle_weight: T.Buffer((ANGLE_DIM, OUT_DIM), "float32"),
-        node_weight: T.Buffer((NODE_DIM, OUT_DIM), "float32"),
-        edge_ik_weight: T.Buffer((EDGE_DIM, OUT_DIM), "float32"),
-        edge_ij_weight: T.Buffer((EDGE_DIM, OUT_DIM), "float32"),
-        bias: T.Buffer((OUT_DIM,), "float32"),
-        out: T.Buffer((N_ANGLE, OUT_DIM), "float32"),
+        flat_angle_ebd: T.Tensor((N_ANGLE, ANGLE_DIM), "float32"),
+        node_ebd: T.Tensor((N_NODE, NODE_DIM), "float32"),
+        flat_edge_ebd: T.Tensor((N_EDGE, EDGE_DIM), "float32"),
+        n2a_index: T.Tensor((N_ANGLE,), "int64"),
+        eij2a_index: T.Tensor((N_ANGLE,), "int64"),
+        eik2a_index: T.Tensor((N_ANGLE,), "int64"),
+        angle_weight: T.Tensor((ANGLE_DIM, OUT_DIM), "float32"),
+        node_weight: T.Tensor((NODE_DIM, OUT_DIM), "float32"),
+        edge_ik_weight: T.Tensor((EDGE_DIM, OUT_DIM), "float32"),
+        edge_ij_weight: T.Tensor((EDGE_DIM, OUT_DIM), "float32"),
+        bias: T.Tensor((OUT_DIM,), "float32"),
+        out: T.Tensor((N_ANGLE, OUT_DIM), "float32"),
     ):
         with T.Kernel(T.ceildiv(N_ANGLE, BLK_M), T.ceildiv(OUT_DIM, BLK_N), threads=128) as (bx, by):
             A = T.alloc_shared((BLK_M, BLK_K), "float32")
@@ -3446,18 +3446,18 @@ def fused_angle_update_backward_inputs(
 
     @T.prim_func
     def backward_inputs(
-        grad_output: T.Buffer((M, K), dtype),
-        n2a_index: T.Buffer((M,), "int64"),
-        eij2a_index: T.Buffer((M,), "int64"),
-        eik2a_index: T.Buffer((M,), "int64"),
-        sub_angle: T.Buffer((A, K), dtype),
-        sub_node: T.Buffer((N, K), dtype),
-        sub_edge_ik: T.Buffer((EK, K), dtype),
-        sub_edge_ij: T.Buffer((EK, K), dtype),
-        grad_flat_angle: T.Buffer((M, A), accum_dtype),
-        grad_flat_node: T.Buffer((N_NODE, N), accum_dtype),
-        grad_flat_edge: T.Buffer((N_EDGE, EK), accum_dtype),
-        grad_bias: T.Buffer((K,), accum_dtype),
+        grad_output: T.Tensor((M, K), dtype),
+        n2a_index: T.Tensor((M,), "int64"),
+        eij2a_index: T.Tensor((M,), "int64"),
+        eik2a_index: T.Tensor((M,), "int64"),
+        sub_angle: T.Tensor((A, K), dtype),
+        sub_node: T.Tensor((N, K), dtype),
+        sub_edge_ik: T.Tensor((EK, K), dtype),
+        sub_edge_ij: T.Tensor((EK, K), dtype),
+        grad_flat_angle: T.Tensor((M, A), accum_dtype),
+        grad_flat_node: T.Tensor((N_NODE, N), accum_dtype),
+        grad_flat_edge: T.Tensor((N_EDGE, EK), accum_dtype),
+        grad_bias: T.Tensor((K,), accum_dtype),
     ):
         with T.Kernel(M, threads=THREADS) as (angle_idx,):
             node_idx = n2a_index[angle_idx]
@@ -3511,17 +3511,17 @@ def fused_angle_update_backward_weights(
 
     @T.prim_func
     def backward_weights(
-        grad_output: T.Buffer((M, K), dtype),
-        flat_angle_ebd: T.Buffer((M, A), dtype),
-        flat_node_ebd: T.Buffer((N_NODE, N), dtype),
-        flat_edge_ebd: T.Buffer((N_EDGE, EK), dtype),
-        n2a_index: T.Buffer((M,), "int64"),
-        eij2a_index: T.Buffer((M,), "int64"),
-        eik2a_index: T.Buffer((M,), "int64"),
-        grad_sub_angle: T.Buffer((A, K), accum_dtype),
-        grad_sub_node: T.Buffer((N, K), accum_dtype),
-        grad_sub_edge_ik: T.Buffer((EK, K), accum_dtype),
-        grad_sub_edge_ij: T.Buffer((EK, K), accum_dtype),
+        grad_output: T.Tensor((M, K), dtype),
+        flat_angle_ebd: T.Tensor((M, A), dtype),
+        flat_node_ebd: T.Tensor((N_NODE, N), dtype),
+        flat_edge_ebd: T.Tensor((N_EDGE, EK), dtype),
+        n2a_index: T.Tensor((M,), "int64"),
+        eij2a_index: T.Tensor((M,), "int64"),
+        eik2a_index: T.Tensor((M,), "int64"),
+        grad_sub_angle: T.Tensor((A, K), accum_dtype),
+        grad_sub_node: T.Tensor((N, K), accum_dtype),
+        grad_sub_edge_ik: T.Tensor((EK, K), accum_dtype),
+        grad_sub_edge_ij: T.Tensor((EK, K), accum_dtype),
     ):
         with T.Kernel(
             T.ceildiv(MAX_D, BLOCK_D),
@@ -3568,10 +3568,10 @@ def fused_angle_node_backward(
 ):
     @T.prim_func
     def angle_node_backward(
-        grad_output: T.Buffer((M, K), dtype),
-        sub_node: T.Buffer((N, K), dtype),
-        n2a_index: T.Buffer((M,), "int64"),
-        grad_flat_node_ebd: T.Buffer((A, N), accum_dtype),
+        grad_output: T.Tensor((M, K), dtype),
+        sub_node: T.Tensor((N, K), dtype),
+        n2a_index: T.Tensor((M,), "int64"),
+        grad_flat_node_ebd: T.Tensor((A, N), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(M, BLOCK_M), T.ceildiv(N, BLOCK_N), threads=128) as (bx, by):
             output_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
@@ -3625,11 +3625,11 @@ def fused_angle_node_backward_v2(
 ):
     @T.prim_func
     def angle_node_backward(
-        grad_output: T.Buffer((M, K), dtype),
-        sub_node: T.Buffer((N, K), dtype),
-        node_start: T.Buffer((A,), "int32"),
-        node_count: T.Buffer((A,), "int32"),
-        grad_flat_node_ebd: T.Buffer((A, N), accum_dtype),
+        grad_output: T.Tensor((M, K), dtype),
+        sub_node: T.Tensor((N, K), dtype),
+        node_start: T.Tensor((A,), "int32"),
+        node_count: T.Tensor((A,), "int32"),
+        grad_flat_node_ebd: T.Tensor((A, N), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(A, BLOCK_M), T.ceildiv(N, BLOCK_N), threads=128) as (bx, by):
             reduced_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
@@ -3694,11 +3694,11 @@ def fused_angle_node_backward_v3(
 
     @T.prim_func
     def angle_node_backward(
-        grad_output: T.Buffer((M, K), dtype),
-        sub_node: T.Buffer((N, K), dtype),
-        node_start: T.Buffer((A,), "int32"),
-        node_count: T.Buffer((A,), "int32"),
-        grad_flat_node_ebd: T.Buffer((A, N), accum_dtype),
+        grad_output: T.Tensor((M, K), dtype),
+        sub_node: T.Tensor((N, K), dtype),
+        node_start: T.Tensor((A,), "int32"),
+        node_count: T.Tensor((A,), "int32"),
+        grad_flat_node_ebd: T.Tensor((A, N), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(A, BLOCK_M), T.ceildiv(N, BLOCK_N), threads=128) as (bx, by):
             reduced_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
@@ -3782,11 +3782,11 @@ def fused_angle_node_backward_v3_1(
 
     @T.prim_func
     def angle_node_backward(
-        grad_output: T.Buffer((M, K), dtype),
-        sub_node: T.Buffer((N, K), dtype),
-        node_start: T.Buffer((A,), "int32"),
-        node_count: T.Buffer((A,), "int32"),
-        grad_flat_node_ebd: T.Buffer((A, N), accum_dtype),
+        grad_output: T.Tensor((M, K), dtype),
+        sub_node: T.Tensor((N, K), dtype),
+        node_start: T.Tensor((A,), "int32"),
+        node_count: T.Tensor((A,), "int32"),
+        grad_flat_node_ebd: T.Tensor((A, N), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(A, BLOCK_M), T.ceildiv(N, BLOCK_N), threads=128) as (bx, by):
             reduced_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
@@ -4207,11 +4207,11 @@ def fused_angle_sub_node_backward_v1(
 
     @T.prim_func
     def sub_node_backward(
-        flat_node_ebd: T.Buffer((A, N), dtype),
-        grad_output: T.Buffer((M, K), dtype),
-        node_start: T.Buffer((A,), "int32"),
-        node_count: T.Buffer((A,), "int32"),
-        grad_sub_node: T.Buffer((N, K), accum_dtype),
+        flat_node_ebd: T.Tensor((A, N), dtype),
+        grad_output: T.Tensor((M, K), dtype),
+        node_start: T.Tensor((A,), "int32"),
+        node_count: T.Tensor((A,), "int32"),
+        grad_sub_node: T.Tensor((N, K), accum_dtype),
     ):
         with T.Kernel(T.ceildiv(N, BLOCK_N), T.ceildiv(K, BLOCK_K), threads=128) as (bx, by):
             reduced_grad_shared = T.alloc_shared((BLOCK_A, BLOCK_K), dtype)
@@ -4371,29 +4371,29 @@ def fused_angle_update_double_backward_inputs(
 
     @T.prim_func
     def double_backward_inputs(
-        grad_output: T.Buffer((M, K), dtype),
-        flat_angle_ebd: T.Buffer((M, A), dtype),
-        flat_node_ebd: T.Buffer((N_NODE, N), dtype),
-        flat_edge_ebd: T.Buffer((N_EDGE, EK), dtype),
-        n2a_index: T.Buffer((M,), "int64"),
-        eij2a_index: T.Buffer((M,), "int64"),
-        eik2a_index: T.Buffer((M,), "int64"),
-        sub_angle: T.Buffer((A, K), dtype),
-        sub_node: T.Buffer((N, K), dtype),
-        sub_edge_ik: T.Buffer((EK, K), dtype),
-        sub_edge_ij: T.Buffer((EK, K), dtype),
-        gg_flat_angle: T.Buffer((M, A), dtype),
-        gg_flat_node: T.Buffer((N_NODE, N), dtype),
-        gg_flat_edge: T.Buffer((N_EDGE, EK), dtype),
-        gg_sub_angle: T.Buffer((A, K), dtype),
-        gg_sub_node: T.Buffer((N, K), dtype),
-        gg_sub_edge_ik: T.Buffer((EK, K), dtype),
-        gg_sub_edge_ij: T.Buffer((EK, K), dtype),
-        gg_bias: T.Buffer((K,), dtype),
-        grad_grad_output: T.Buffer((M, K), accum_dtype),
-        grad_flat_angle: T.Buffer((M, A), accum_dtype),
-        grad_flat_node: T.Buffer((N_NODE, N), accum_dtype),
-        grad_flat_edge: T.Buffer((N_EDGE, EK), accum_dtype),
+        grad_output: T.Tensor((M, K), dtype),
+        flat_angle_ebd: T.Tensor((M, A), dtype),
+        flat_node_ebd: T.Tensor((N_NODE, N), dtype),
+        flat_edge_ebd: T.Tensor((N_EDGE, EK), dtype),
+        n2a_index: T.Tensor((M,), "int64"),
+        eij2a_index: T.Tensor((M,), "int64"),
+        eik2a_index: T.Tensor((M,), "int64"),
+        sub_angle: T.Tensor((A, K), dtype),
+        sub_node: T.Tensor((N, K), dtype),
+        sub_edge_ik: T.Tensor((EK, K), dtype),
+        sub_edge_ij: T.Tensor((EK, K), dtype),
+        gg_flat_angle: T.Tensor((M, A), dtype),
+        gg_flat_node: T.Tensor((N_NODE, N), dtype),
+        gg_flat_edge: T.Tensor((N_EDGE, EK), dtype),
+        gg_sub_angle: T.Tensor((A, K), dtype),
+        gg_sub_node: T.Tensor((N, K), dtype),
+        gg_sub_edge_ik: T.Tensor((EK, K), dtype),
+        gg_sub_edge_ij: T.Tensor((EK, K), dtype),
+        gg_bias: T.Tensor((K,), dtype),
+        grad_grad_output: T.Tensor((M, K), accum_dtype),
+        grad_flat_angle: T.Tensor((M, A), accum_dtype),
+        grad_flat_node: T.Tensor((N_NODE, N), accum_dtype),
+        grad_flat_edge: T.Tensor((N_EDGE, EK), accum_dtype),
     ):
         with T.Kernel(M, threads=THREADS) as (angle_idx,):
             node_idx = n2a_index[angle_idx]
@@ -4466,17 +4466,17 @@ def fused_angle_update_double_backward_weights(
 
     @T.prim_func
     def double_backward_weights(
-        grad_output: T.Buffer((M, K), dtype),
-        n2a_index: T.Buffer((M,), "int64"),
-        eij2a_index: T.Buffer((M,), "int64"),
-        eik2a_index: T.Buffer((M,), "int64"),
-        gg_flat_angle: T.Buffer((M, A), dtype),
-        gg_flat_node: T.Buffer((N_NODE, N), dtype),
-        gg_flat_edge: T.Buffer((N_EDGE, EK), dtype),
-        grad_sub_angle: T.Buffer((A, K), accum_dtype),
-        grad_sub_node: T.Buffer((N, K), accum_dtype),
-        grad_sub_edge_ik: T.Buffer((EK, K), accum_dtype),
-        grad_sub_edge_ij: T.Buffer((EK, K), accum_dtype),
+        grad_output: T.Tensor((M, K), dtype),
+        n2a_index: T.Tensor((M,), "int64"),
+        eij2a_index: T.Tensor((M,), "int64"),
+        eik2a_index: T.Tensor((M,), "int64"),
+        gg_flat_angle: T.Tensor((M, A), dtype),
+        gg_flat_node: T.Tensor((N_NODE, N), dtype),
+        gg_flat_edge: T.Tensor((N_EDGE, EK), dtype),
+        grad_sub_angle: T.Tensor((A, K), accum_dtype),
+        grad_sub_node: T.Tensor((N, K), accum_dtype),
+        grad_sub_edge_ik: T.Tensor((EK, K), accum_dtype),
+        grad_sub_edge_ij: T.Tensor((EK, K), accum_dtype),
     ):
         with T.Kernel(
             T.ceildiv(MAX_D, BLOCK_D),
