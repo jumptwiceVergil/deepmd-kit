@@ -39,7 +39,11 @@ class LoopInterpreter:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument("--dump-dir", type=Path,
+                        help="Save generated kernel source and failing tensors for diagnosis")
     args = parser.parse_args()
+    if args.dump_dir:
+        args.dump_dir.mkdir(parents=True, exist_ok=True)
     if args.device == "cuda" and not torch.cuda.is_available():
         parser.error("CUDA-enabled PyTorch and a GPU are required")
     source = Path(__file__).with_name("utils_tilelang.py")
@@ -118,6 +122,11 @@ def main():
             call_args = [tensors[p.arg] for p in inner.args.args]
             kernel = namespace[name](**dims)
             if args.device == "cuda":
+                if args.dump_dir:
+                    get_source = getattr(kernel, "get_kernel_source", None)
+                    if get_source is not None:
+                        tag = f"{kind}_{side}_{rows}_{k}_{da}_{dn}_{de}"
+                        (args.dump_dir / f"{tag}.cu").write_text(get_source(), encoding="utf-8")
                 kernel(*call_args)
             else:
                 defaults = {p.arg: ast.literal_eval(v) for p, v in zip(node.args.args[-len(node.args.defaults):], node.args.defaults)}
@@ -129,9 +138,38 @@ def main():
                     for interpreter.grid in itertools.product(*(range(v) for v in grid)):
                         kernel(*call_args)
         for result_name, expected in zip([oname, *outputs.values()], reference):
-            torch.testing.assert_close(tensors[result_name], expected,
-                                       atol=2e-4 if args.device == "cuda" else 1e-10,
-                                       rtol=2e-3 if args.device == "cuda" else 1e-10)
+            try:
+                torch.testing.assert_close(tensors[result_name], expected,
+                                           atol=2e-4 if args.device == "cuda" else 1e-10,
+                                           rtol=2e-3 if args.device == "cuda" else 1e-10)
+            except AssertionError:
+                actual_cpu = tensors[result_name].detach().cpu()
+                expected_cpu = expected.detach().cpu()
+                print(f"FAIL {kind} {shape} tensor={result_name}", flush=True)
+                if args.dump_dir:
+                    torch.save({"tensors": {n: t.detach().cpu() for n, t in tensors.items()},
+                                "failed_output": result_name, "expected": expected_cpu, "dims": dims},
+                               args.dump_dir / f"failure_{kind}_{rows}_{k}.pt")
+                if result_name == oname and dtype == torch.float32:
+                    # Diagnostic only: model TF32 operand rounding, not GPU
+                    # scheduling or exact tensor-core accumulation order.
+                    def rounded(value, mode):
+                        bits = value.detach().cpu().contiguous().view(torch.int32)
+                        if mode == "rn":
+                            bits = bits + 4095 + ((bits >> 13) & 1)
+                        return (bits & -8192).view(torch.float32).double()
+                    for mode in ("rn", "rz"):
+                        approx = tensors[uname].detach().cpu().double().expand(rows, k).clone()
+                        for x, ux, w, uw, gx, gw, ix, xs in groups:
+                            xx, uu = rounded(tensors[x], mode), rounded(tensors[ux], mode)
+                            if ix is not None:
+                                ii = tensors[ix].cpu()
+                                xx, uu = xx[ii], uu[ii]
+                            approx += uu @ rounded(tensors[w], mode) + xx @ rounded(tensors[uw], mode)
+                        error = (actual_cpu.double() - approx).abs()
+                        print(f"  TF32-{mode} model: max_abs={error.max().item():.6g}, "
+                              f"relative_l2={(error.norm()/approx.norm().clamp_min(1e-30)).item():.6g}", flush=True)
+                raise
         print(f"PASS {kind} {shape} input_cotangents_only={only_input_cotangents}", flush=True)
     print("CPU interpretation only; CUDA scheduling is not verified." if args.device == "cpu" else "CUDA kernel checks passed.")
 
