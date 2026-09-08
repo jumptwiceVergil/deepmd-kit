@@ -2670,6 +2670,9 @@ def fused_edge_update_double_backward_inputs(
     dtype="float32",
     accum_dtype="float32",
     THREADS=128,
+    BLOCK_M=32,
+    BLOCK_N=32,
+    BLOCK_K=32,
 ):
     """Fuse grad-grad-output and all three input-side VJPs."""
 
@@ -2696,47 +2699,266 @@ def fused_edge_update_double_backward_inputs(
         grad_node_ebd_ext: T.Tensor((N_ext, D_ext), accum_dtype),
         grad_flat_edge_ebd: T.Tensor((E, D_edge), accum_dtype),
     ):
-        with T.Kernel(E, threads=THREADS) as (edge_idx,):
-            node_idx = n2e_index[edge_idx]
-            ext_idx = n_ext2e_index[edge_idx]
+        # Original scalar implementation (retained for reference):
+        # with T.Kernel(E, threads=THREADS) as (edge_idx,):
+        # node_idx = n2e_index[edge_idx]
+        # ext_idx = n_ext2e_index[edge_idx]
+        #
+        # for k in T.Parallel(K):
+        # acc = T.alloc_var(accum_dtype)
+        # acc = grad_grad_bias[k]
+        # for d in T.serial(D_edge):
+        # acc += (
+        # grad_grad_edge_ebd[edge_idx, d] * edge_weight[d, k]
+        # + flat_edge_ebd[edge_idx, d] * grad_grad_edge_weight[d, k]
+        # )
+        # for d in T.serial(D_node):
+        # acc += (
+        # node_ebd[node_idx, d] * grad_grad_node_weight[d, k]
+        # + grad_grad_node[node_idx, d] * node_weight[d, k]
+        # )
+        # for d in T.serial(D_ext):
+        # acc += (
+        # node_ebd_ext[ext_idx, d] * grad_grad_node_ext_weight[d, k]
+        # + grad_grad_node_ext[ext_idx, d] * node_ext_weight[d, k]
+        # )
+        # grad_grad_out[edge_idx, k] = acc
+        #
+        # for d in T.Parallel(D_edge):
+        # acc = T.alloc_var(accum_dtype, init=0)
+        # for k in T.serial(K):
+        # acc += grad_out[edge_idx, k] * grad_grad_edge_weight[d, k]
+        # grad_flat_edge_ebd[edge_idx, d] = acc
+        #
+        # for d in T.Parallel(D_node):
+        # acc = T.alloc_var(accum_dtype, init=0)
+        # for k in T.serial(K):
+        # acc += grad_out[edge_idx, k] * grad_grad_node_weight[d, k]
+        # T.atomic_add(grad_node_ebd[node_idx, d], acc)
+        #
+        # for d in T.Parallel(D_ext):
+        # acc = T.alloc_var(accum_dtype, init=0)
+        # for k in T.serial(K):
+        # acc += grad_out[edge_idx, k] * grad_grad_node_ext_weight[d, k]
+        # T.atomic_add(grad_node_ebd_ext[ext_idx, d], acc)
 
-            for k in T.Parallel(K):
-                acc = T.alloc_var(accum_dtype)
-                acc = grad_grad_bias[k]
-                for d in T.serial(D_edge):
-                    acc += (
-                        grad_grad_edge_ebd[edge_idx, d] * edge_weight[d, k]
-                        + flat_edge_ebd[edge_idx, d] * grad_grad_edge_weight[d, k]
-                    )
-                for d in T.serial(D_node):
-                    acc += (
-                        node_ebd[node_idx, d] * grad_grad_node_weight[d, k]
-                        + grad_grad_node[node_idx, d] * node_weight[d, k]
-                    )
-                for d in T.serial(D_ext):
-                    acc += (
-                        node_ebd_ext[ext_idx, d] * grad_grad_node_ext_weight[d, k]
-                        + grad_grad_node_ext[ext_idx, d] * node_ext_weight[d, k]
-                    )
-                grad_grad_out[edge_idx, k] = acc
+        # A common output-column grid covers grad-grad-output and input VJPs.
+        with T.Kernel(T.ceildiv(E, BLOCK_M), T.ceildiv(max(K, D_edge, D_node, D_ext), BLOCK_N), threads=THREADS) as (bx, by):
+            lhs_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            rhs_shared = T.alloc_shared((BLOCK_K, BLOCK_N), dtype)
+            acc_output = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
+            acc_input = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
+            T.clear(acc_output)
+            if by * BLOCK_N < K:
+                # edge: U_x W and X U_w; each has its own pipeline.
+                for ro in T.Pipelined(T.ceildiv(D_edge, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < E and r < D_edge:
+                            lhs_shared[mi, ri] = grad_grad_edge_ebd[m, r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < D_edge and n < K:
+                            rhs_shared[ri, ni] = edge_weight[r, n]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_output)
+                    T.sync_threads()
+                T.sync_threads()
+                for ro in T.Pipelined(T.ceildiv(D_edge, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < E and r < D_edge:
+                            lhs_shared[mi, ri] = flat_edge_ebd[m, r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < D_edge and n < K:
+                            rhs_shared[ri, ni] = grad_grad_edge_weight[r, n]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_output)
+                    T.sync_threads()
+                T.sync_threads()
+                # node: U_x W and X U_w; each has its own pipeline.
+                for ro in T.Pipelined(T.ceildiv(D_node, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < E and r < D_node:
+                            lhs_shared[mi, ri] = grad_grad_node[n2e_index[m], r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < D_node and n < K:
+                            rhs_shared[ri, ni] = node_weight[r, n]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_output)
+                    T.sync_threads()
+                T.sync_threads()
+                for ro in T.Pipelined(T.ceildiv(D_node, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < E and r < D_node:
+                            lhs_shared[mi, ri] = node_ebd[n2e_index[m], r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < D_node and n < K:
+                            rhs_shared[ri, ni] = grad_grad_node_weight[r, n]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_output)
+                    T.sync_threads()
+                T.sync_threads()
+                # ext: U_x W and X U_w; each has its own pipeline.
+                for ro in T.Pipelined(T.ceildiv(D_ext, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < E and r < D_ext:
+                            lhs_shared[mi, ri] = grad_grad_node_ext[n_ext2e_index[m], r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < D_ext and n < K:
+                            rhs_shared[ri, ni] = node_ext_weight[r, n]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_output)
+                    T.sync_threads()
+                T.sync_threads()
+                for ro in T.Pipelined(T.ceildiv(D_ext, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < E and r < D_ext:
+                            lhs_shared[mi, ri] = node_ebd_ext[n_ext2e_index[m], r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < D_ext and n < K:
+                            rhs_shared[ri, ni] = grad_grad_node_ext_weight[r, n]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_output)
+                    T.sync_threads()
+                T.sync_threads()
+            for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                m = bx * BLOCK_M + mi
+                n = by * BLOCK_N + ni
+                if m < E and n < K:
+                    grad_grad_out[m, n] = acc_output[mi, ni] + grad_grad_bias[n]
 
-            for d in T.Parallel(D_edge):
-                acc = T.alloc_var(accum_dtype, init=0)
-                for k in T.serial(K):
-                    acc += grad_out[edge_idx, k] * grad_grad_edge_weight[d, k]
-                grad_flat_edge_ebd[edge_idx, d] = acc
+            # edge input VJP: G U_w.T; reuse the fragment after writeback.
+            if by * BLOCK_N < D_edge:
+                T.clear(acc_input)
+                for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < E and r < K:
+                            lhs_shared[mi, ri] = grad_out[m, r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < K and n < D_edge:
+                            rhs_shared[ri, ni] = grad_grad_edge_weight[n, r]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_input)
+                    T.sync_threads()
+                T.sync_threads()
+                for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                    m = bx * BLOCK_M + mi
+                    n = by * BLOCK_N + ni
+                    if m < E and n < D_edge:
+                        grad_flat_edge_ebd[m, n] = acc_input[mi, ni]
+                T.sync_threads()
 
-            for d in T.Parallel(D_node):
-                acc = T.alloc_var(accum_dtype, init=0)
-                for k in T.serial(K):
-                    acc += grad_out[edge_idx, k] * grad_grad_node_weight[d, k]
-                T.atomic_add(grad_node_ebd[node_idx, d], acc)
+            # node input VJP: G U_w.T; reuse the fragment after writeback.
+            if by * BLOCK_N < D_node:
+                T.clear(acc_input)
+                for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < E and r < K:
+                            lhs_shared[mi, ri] = grad_out[m, r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < K and n < D_node:
+                            rhs_shared[ri, ni] = grad_grad_node_weight[n, r]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_input)
+                    T.sync_threads()
+                T.sync_threads()
+                for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                    m = bx * BLOCK_M + mi
+                    n = by * BLOCK_N + ni
+                    if m < E and n < D_node:
+                        T.atomic_add(grad_node_ebd[n2e_index[m], n], acc_input[mi, ni])
+                T.sync_threads()
 
-            for d in T.Parallel(D_ext):
-                acc = T.alloc_var(accum_dtype, init=0)
-                for k in T.serial(K):
-                    acc += grad_out[edge_idx, k] * grad_grad_node_ext_weight[d, k]
-                T.atomic_add(grad_node_ebd_ext[ext_idx, d], acc)
+            # ext input VJP: G U_w.T; reuse the fragment after writeback.
+            if by * BLOCK_N < D_ext:
+                T.clear(acc_input)
+                for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < E and r < K:
+                            lhs_shared[mi, ri] = grad_out[m, r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < K and n < D_ext:
+                            rhs_shared[ri, ni] = grad_grad_node_ext_weight[n, r]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_input)
+                    T.sync_threads()
+                T.sync_threads()
+                for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                    m = bx * BLOCK_M + mi
+                    n = by * BLOCK_N + ni
+                    if m < E and n < D_ext:
+                        T.atomic_add(grad_node_ebd_ext[n_ext2e_index[m], n], acc_input[mi, ni])
+                T.sync_threads()
 
     return double_backward_inputs
 
@@ -2752,9 +2974,11 @@ def fused_edge_update_double_backward_weights(
     N_ext,
     dtype="float32",
     accum_dtype="float32",
-    BLOCK_D=16,
+    # Original scalar tile: BLOCK_D=16.
+    BLOCK_D=32,
     BLOCK_K=16,
     THREADS=128,
+    BLOCK_M=32,
 ):
     """Fuse the three weight-side VJPs into one balanced reduction kernel."""
     MAX_D = max(D_edge, D_node, D_ext)
@@ -2771,30 +2995,119 @@ def fused_edge_update_double_backward_weights(
         grad_node_ext_weight: T.Tensor((D_ext, K), accum_dtype),
         grad_edge_weight: T.Tensor((D_edge, K), accum_dtype),
     ):
-        with T.Kernel(
-            T.ceildiv(MAX_D, BLOCK_D),
-            T.ceildiv(K, BLOCK_K),
-            threads=THREADS,
-        ) as (bx, by):
+        # Original scalar implementation (retained for reference):
+        # with T.Kernel(
+        # T.ceildiv(MAX_D, BLOCK_D),
+        # T.ceildiv(K, BLOCK_K),
+        # threads=THREADS,
+        # ) as (bx, by):
+        # for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+        # d = bx * BLOCK_D + di
+        # k = by * BLOCK_K + ki
+        # if k < K:
+        # if d < D_edge:
+        # acc_edge = T.alloc_var(accum_dtype, init=0)
+        # for e in T.serial(E):
+        # acc_edge += grad_grad_edge_ebd[e, d] * grad_out[e, k]
+        # grad_edge_weight[d, k] = acc_edge
+        # if d < D_node:
+        # acc_node = T.alloc_var(accum_dtype, init=0)
+        # for e in T.serial(E):
+        # acc_node += grad_grad_node[n2e_index[e], d] * grad_out[e, k]
+        # grad_node_weight[d, k] = acc_node
+        # if d < D_ext:
+        # acc_ext = T.alloc_var(accum_dtype, init=0)
+        # for e in T.serial(E):
+        # acc_ext += grad_grad_node_ext[n_ext2e_index[e], d] * grad_out[e, k]
+        # grad_node_ext_weight[d, k] = acc_ext
+
+        with T.Kernel(T.ceildiv(MAX_D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=THREADS) as (bx, by):
+            feature_shared = T.alloc_shared((BLOCK_M, BLOCK_D), dtype)
+            grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            # edge: gathered U_x.T @ G, with row-major shared loads.
+            T.clear(acc)
+            for mo in T.Pipelined(T.ceildiv(E, BLOCK_M), num_stages=2):
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                    m = mo * BLOCK_M + mi
+                    d = bx * BLOCK_D + di
+                    if m < E and d < D_edge:
+                        feature_shared[mi, di] = grad_grad_edge_ebd[m, d]
+                    else:
+                        feature_shared[mi, di] = 0
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = mo * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < E and k < K:
+                        grad_shared[mi, ki] = grad_out[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
+                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                T.sync_threads()
+            T.sync_threads()
             for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
                 d = bx * BLOCK_D + di
                 k = by * BLOCK_K + ki
-                if k < K:
-                    if d < D_edge:
-                        acc_edge = T.alloc_var(accum_dtype, init=0)
-                        for e in T.serial(E):
-                            acc_edge += grad_grad_edge_ebd[e, d] * grad_out[e, k]
-                        grad_edge_weight[d, k] = acc_edge
-                    if d < D_node:
-                        acc_node = T.alloc_var(accum_dtype, init=0)
-                        for e in T.serial(E):
-                            acc_node += grad_grad_node[n2e_index[e], d] * grad_out[e, k]
-                        grad_node_weight[d, k] = acc_node
-                    if d < D_ext:
-                        acc_ext = T.alloc_var(accum_dtype, init=0)
-                        for e in T.serial(E):
-                            acc_ext += grad_grad_node_ext[n_ext2e_index[e], d] * grad_out[e, k]
-                        grad_node_ext_weight[d, k] = acc_ext
+                if d < D_edge and k < K:
+                    grad_edge_weight[d, k] = acc[di, ki]
+            T.sync_threads()
+
+            # node: gathered U_x.T @ G, with row-major shared loads.
+            T.clear(acc)
+            for mo in T.Pipelined(T.ceildiv(E, BLOCK_M), num_stages=2):
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                    m = mo * BLOCK_M + mi
+                    d = bx * BLOCK_D + di
+                    if m < E and d < D_node:
+                        feature_shared[mi, di] = grad_grad_node[n2e_index[m], d]
+                    else:
+                        feature_shared[mi, di] = 0
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = mo * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < E and k < K:
+                        grad_shared[mi, ki] = grad_out[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
+                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                T.sync_threads()
+            T.sync_threads()
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < D_node and k < K:
+                    grad_node_weight[d, k] = acc[di, ki]
+            T.sync_threads()
+
+            # ext: gathered U_x.T @ G, with row-major shared loads.
+            T.clear(acc)
+            for mo in T.Pipelined(T.ceildiv(E, BLOCK_M), num_stages=2):
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                    m = mo * BLOCK_M + mi
+                    d = bx * BLOCK_D + di
+                    if m < E and d < D_ext:
+                        feature_shared[mi, di] = grad_grad_node_ext[n_ext2e_index[m], d]
+                    else:
+                        feature_shared[mi, di] = 0
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = mo * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < E and k < K:
+                        grad_shared[mi, ki] = grad_out[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
+                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                T.sync_threads()
+            T.sync_threads()
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < D_ext and k < K:
+                    grad_node_ext_weight[d, k] = acc[di, ki]
+            T.sync_threads()
 
     return double_backward_weights
 
@@ -4602,6 +4915,9 @@ def fused_angle_update_double_backward_inputs(
     dtype="float32",
     accum_dtype="float32",
     THREADS=128,
+    BLOCK_M=32,
+    BLOCK_N=32,
+    BLOCK_K=32,
 ):
     """Fuse grad-grad-output and angle/node/edge input-side VJPs."""
 
@@ -4631,53 +4947,340 @@ def fused_angle_update_double_backward_inputs(
         grad_flat_node: T.Tensor((N_NODE, N), accum_dtype),
         grad_flat_edge: T.Tensor((N_EDGE, EK), accum_dtype),
     ):
-        with T.Kernel(M, threads=THREADS) as (angle_idx,):
-            node_idx = n2a_index[angle_idx]
-            edge_ik_idx = eik2a_index[angle_idx]
-            edge_ij_idx = eij2a_index[angle_idx]
+        # Original scalar implementation (retained for reference):
+        # with T.Kernel(M, threads=THREADS) as (angle_idx,):
+        # node_idx = n2a_index[angle_idx]
+        # edge_ik_idx = eik2a_index[angle_idx]
+        # edge_ij_idx = eij2a_index[angle_idx]
+        #
+        # for k in T.Parallel(K):
+        # acc = T.alloc_var(accum_dtype)
+        # acc = gg_bias[k]
+        # for d in T.serial(A):
+        # acc += (
+        # gg_flat_angle[angle_idx, d] * sub_angle[d, k]
+        # + flat_angle_ebd[angle_idx, d] * gg_sub_angle[d, k]
+        # )
+        # for d in T.serial(N):
+        # acc += (
+        # gg_flat_node[node_idx, d] * sub_node[d, k]
+        # + flat_node_ebd[node_idx, d] * gg_sub_node[d, k]
+        # )
+        # for d in T.serial(EK):
+        # acc += (
+        # gg_flat_edge[edge_ik_idx, d] * sub_edge_ik[d, k]
+        # + flat_edge_ebd[edge_ik_idx, d] * gg_sub_edge_ik[d, k]
+        # + gg_flat_edge[edge_ij_idx, d] * sub_edge_ij[d, k]
+        # + flat_edge_ebd[edge_ij_idx, d] * gg_sub_edge_ij[d, k]
+        # )
+        # grad_grad_output[angle_idx, k] = acc
+        #
+        # for d in T.Parallel(A):
+        # acc = T.alloc_var(accum_dtype, init=0)
+        # for k in T.serial(K):
+        # acc += grad_output[angle_idx, k] * gg_sub_angle[d, k]
+        # grad_flat_angle[angle_idx, d] = acc
+        #
+        # for d in T.Parallel(N):
+        # acc = T.alloc_var(accum_dtype, init=0)
+        # for k in T.serial(K):
+        # acc += grad_output[angle_idx, k] * gg_sub_node[d, k]
+        # T.atomic_add(grad_flat_node[node_idx, d], acc)
+        #
+        # for d in T.Parallel(EK):
+        # acc_ik = T.alloc_var(accum_dtype, init=0)
+        # acc_ij = T.alloc_var(accum_dtype, init=0)
+        # for k in T.serial(K):
+        # acc_ik += grad_output[angle_idx, k] * gg_sub_edge_ik[d, k]
+        # acc_ij += grad_output[angle_idx, k] * gg_sub_edge_ij[d, k]
+        # T.atomic_add(grad_flat_edge[edge_ik_idx, d], acc_ik)
+        # T.atomic_add(grad_flat_edge[edge_ij_idx, d], acc_ij)
 
-            for k in T.Parallel(K):
-                acc = T.alloc_var(accum_dtype)
-                acc = gg_bias[k]
-                for d in T.serial(A):
-                    acc += (
-                        gg_flat_angle[angle_idx, d] * sub_angle[d, k]
-                        + flat_angle_ebd[angle_idx, d] * gg_sub_angle[d, k]
-                    )
-                for d in T.serial(N):
-                    acc += (
-                        gg_flat_node[node_idx, d] * sub_node[d, k]
-                        + flat_node_ebd[node_idx, d] * gg_sub_node[d, k]
-                    )
-                for d in T.serial(EK):
-                    acc += (
-                        gg_flat_edge[edge_ik_idx, d] * sub_edge_ik[d, k]
-                        + flat_edge_ebd[edge_ik_idx, d] * gg_sub_edge_ik[d, k]
-                        + gg_flat_edge[edge_ij_idx, d] * sub_edge_ij[d, k]
-                        + flat_edge_ebd[edge_ij_idx, d] * gg_sub_edge_ij[d, k]
-                    )
-                grad_grad_output[angle_idx, k] = acc
+        # A common output-column grid covers grad-grad-output and input VJPs.
+        with T.Kernel(T.ceildiv(M, BLOCK_M), T.ceildiv(max(K, A, N, EK, EK), BLOCK_N), threads=THREADS) as (bx, by):
+            lhs_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            rhs_shared = T.alloc_shared((BLOCK_K, BLOCK_N), dtype)
+            acc_output = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
+            acc_input = T.alloc_fragment((BLOCK_M, BLOCK_N), accum_dtype)
+            T.clear(acc_output)
+            if by * BLOCK_N < K:
+                # angle: U_x W and X U_w; each has its own pipeline.
+                for ro in T.Pipelined(T.ceildiv(A, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < M and r < A:
+                            lhs_shared[mi, ri] = gg_flat_angle[m, r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < A and n < K:
+                            rhs_shared[ri, ni] = sub_angle[r, n]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_output)
+                    T.sync_threads()
+                T.sync_threads()
+                for ro in T.Pipelined(T.ceildiv(A, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < M and r < A:
+                            lhs_shared[mi, ri] = flat_angle_ebd[m, r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < A and n < K:
+                            rhs_shared[ri, ni] = gg_sub_angle[r, n]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_output)
+                    T.sync_threads()
+                T.sync_threads()
+                # node: U_x W and X U_w; each has its own pipeline.
+                for ro in T.Pipelined(T.ceildiv(N, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < M and r < N:
+                            lhs_shared[mi, ri] = gg_flat_node[n2a_index[m], r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < N and n < K:
+                            rhs_shared[ri, ni] = sub_node[r, n]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_output)
+                    T.sync_threads()
+                T.sync_threads()
+                for ro in T.Pipelined(T.ceildiv(N, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < M and r < N:
+                            lhs_shared[mi, ri] = flat_node_ebd[n2a_index[m], r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < N and n < K:
+                            rhs_shared[ri, ni] = gg_sub_node[r, n]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_output)
+                    T.sync_threads()
+                T.sync_threads()
+                # ik: U_x W and X U_w; each has its own pipeline.
+                for ro in T.Pipelined(T.ceildiv(EK, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < M and r < EK:
+                            lhs_shared[mi, ri] = gg_flat_edge[eik2a_index[m], r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < EK and n < K:
+                            rhs_shared[ri, ni] = sub_edge_ik[r, n]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_output)
+                    T.sync_threads()
+                T.sync_threads()
+                for ro in T.Pipelined(T.ceildiv(EK, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < M and r < EK:
+                            lhs_shared[mi, ri] = flat_edge_ebd[eik2a_index[m], r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < EK and n < K:
+                            rhs_shared[ri, ni] = gg_sub_edge_ik[r, n]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_output)
+                    T.sync_threads()
+                T.sync_threads()
+                # ij: U_x W and X U_w; each has its own pipeline.
+                for ro in T.Pipelined(T.ceildiv(EK, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < M and r < EK:
+                            lhs_shared[mi, ri] = gg_flat_edge[eij2a_index[m], r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < EK and n < K:
+                            rhs_shared[ri, ni] = sub_edge_ij[r, n]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_output)
+                    T.sync_threads()
+                T.sync_threads()
+                for ro in T.Pipelined(T.ceildiv(EK, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < M and r < EK:
+                            lhs_shared[mi, ri] = flat_edge_ebd[eij2a_index[m], r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < EK and n < K:
+                            rhs_shared[ri, ni] = gg_sub_edge_ij[r, n]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_output)
+                    T.sync_threads()
+                T.sync_threads()
+            for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                m = bx * BLOCK_M + mi
+                n = by * BLOCK_N + ni
+                if m < M and n < K:
+                    grad_grad_output[m, n] = acc_output[mi, ni] + gg_bias[n]
 
-            for d in T.Parallel(A):
-                acc = T.alloc_var(accum_dtype, init=0)
-                for k in T.serial(K):
-                    acc += grad_output[angle_idx, k] * gg_sub_angle[d, k]
-                grad_flat_angle[angle_idx, d] = acc
+            # angle input VJP: G U_w.T; reuse the fragment after writeback.
+            if by * BLOCK_N < A:
+                T.clear(acc_input)
+                for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < M and r < K:
+                            lhs_shared[mi, ri] = grad_output[m, r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < K and n < A:
+                            rhs_shared[ri, ni] = gg_sub_angle[n, r]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_input)
+                    T.sync_threads()
+                T.sync_threads()
+                for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                    m = bx * BLOCK_M + mi
+                    n = by * BLOCK_N + ni
+                    if m < M and n < A:
+                        grad_flat_angle[m, n] = acc_input[mi, ni]
+                T.sync_threads()
 
-            for d in T.Parallel(N):
-                acc = T.alloc_var(accum_dtype, init=0)
-                for k in T.serial(K):
-                    acc += grad_output[angle_idx, k] * gg_sub_node[d, k]
-                T.atomic_add(grad_flat_node[node_idx, d], acc)
+            # node input VJP: G U_w.T; reuse the fragment after writeback.
+            if by * BLOCK_N < N:
+                T.clear(acc_input)
+                for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < M and r < K:
+                            lhs_shared[mi, ri] = grad_output[m, r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < K and n < N:
+                            rhs_shared[ri, ni] = gg_sub_node[n, r]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_input)
+                    T.sync_threads()
+                T.sync_threads()
+                for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                    m = bx * BLOCK_M + mi
+                    n = by * BLOCK_N + ni
+                    if m < M and n < N:
+                        T.atomic_add(grad_flat_node[n2a_index[m], n], acc_input[mi, ni])
+                T.sync_threads()
 
-            for d in T.Parallel(EK):
-                acc_ik = T.alloc_var(accum_dtype, init=0)
-                acc_ij = T.alloc_var(accum_dtype, init=0)
-                for k in T.serial(K):
-                    acc_ik += grad_output[angle_idx, k] * gg_sub_edge_ik[d, k]
-                    acc_ij += grad_output[angle_idx, k] * gg_sub_edge_ij[d, k]
-                T.atomic_add(grad_flat_edge[edge_ik_idx, d], acc_ik)
-                T.atomic_add(grad_flat_edge[edge_ij_idx, d], acc_ij)
+            # ik input VJP: G U_w.T; reuse the fragment after writeback.
+            if by * BLOCK_N < EK:
+                T.clear(acc_input)
+                for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < M and r < K:
+                            lhs_shared[mi, ri] = grad_output[m, r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < K and n < EK:
+                            rhs_shared[ri, ni] = gg_sub_edge_ik[n, r]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_input)
+                    T.sync_threads()
+                T.sync_threads()
+                for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                    m = bx * BLOCK_M + mi
+                    n = by * BLOCK_N + ni
+                    if m < M and n < EK:
+                        T.atomic_add(grad_flat_edge[eik2a_index[m], n], acc_input[mi, ni])
+                T.sync_threads()
+
+            # ij input VJP: G U_w.T; reuse the fragment after writeback.
+            if by * BLOCK_N < EK:
+                T.clear(acc_input)
+                for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = bx * BLOCK_M + mi
+                        r = ro * BLOCK_K + ri
+                        if m < M and r < K:
+                            lhs_shared[mi, ri] = grad_output[m, r]
+                        else:
+                            lhs_shared[mi, ri] = 0
+                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        r = ro * BLOCK_K + ri
+                        n = by * BLOCK_N + ni
+                        if r < K and n < EK:
+                            rhs_shared[ri, ni] = gg_sub_edge_ij[n, r]
+                        else:
+                            rhs_shared[ri, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs_shared, rhs_shared, acc_input)
+                    T.sync_threads()
+                T.sync_threads()
+                for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                    m = bx * BLOCK_M + mi
+                    n = by * BLOCK_N + ni
+                    if m < M and n < EK:
+                        T.atomic_add(grad_flat_edge[eij2a_index[m], n], acc_input[mi, ni])
+                T.sync_threads()
 
     return double_backward_inputs
 
@@ -4693,9 +5296,11 @@ def fused_angle_update_double_backward_weights(
     N_EDGE,
     dtype="float32",
     accum_dtype="float32",
-    BLOCK_D=16,
+    # Original scalar tile: BLOCK_D=16.
+    BLOCK_D=32,
     BLOCK_K=16,
     THREADS=128,
+    BLOCK_M=32,
 ):
     """Fuse all four weight-side VJPs into one reduction kernel."""
     MAX_D = max(A, N, EK)
@@ -4714,33 +5319,150 @@ def fused_angle_update_double_backward_weights(
         grad_sub_edge_ik: T.Tensor((EK, K), accum_dtype),
         grad_sub_edge_ij: T.Tensor((EK, K), accum_dtype),
     ):
-        with T.Kernel(
-            T.ceildiv(MAX_D, BLOCK_D),
-            T.ceildiv(K, BLOCK_K),
-            threads=THREADS,
-        ) as (bx, by):
+        # Original scalar implementation (retained for reference):
+        # with T.Kernel(
+        # T.ceildiv(MAX_D, BLOCK_D),
+        # T.ceildiv(K, BLOCK_K),
+        # threads=THREADS,
+        # ) as (bx, by):
+        # for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+        # d = bx * BLOCK_D + di
+        # k = by * BLOCK_K + ki
+        # if k < K:
+        # if d < A:
+        # acc_angle = T.alloc_var(accum_dtype, init=0)
+        # for m in T.serial(M):
+        # acc_angle += gg_flat_angle[m, d] * grad_output[m, k]
+        # grad_sub_angle[d, k] = acc_angle
+        # if d < N:
+        # acc_node = T.alloc_var(accum_dtype, init=0)
+        # for m in T.serial(M):
+        # acc_node += gg_flat_node[n2a_index[m], d] * grad_output[m, k]
+        # grad_sub_node[d, k] = acc_node
+        # if d < EK:
+        # acc_ik = T.alloc_var(accum_dtype, init=0)
+        # acc_ij = T.alloc_var(accum_dtype, init=0)
+        # for m in T.serial(M):
+        # acc_ik += gg_flat_edge[eik2a_index[m], d] * grad_output[m, k]
+        # acc_ij += gg_flat_edge[eij2a_index[m], d] * grad_output[m, k]
+        # grad_sub_edge_ik[d, k] = acc_ik
+        # grad_sub_edge_ij[d, k] = acc_ij
+
+        with T.Kernel(T.ceildiv(MAX_D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=THREADS) as (bx, by):
+            feature_shared = T.alloc_shared((BLOCK_M, BLOCK_D), dtype)
+            grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            # angle: gathered U_x.T @ G, with row-major shared loads.
+            T.clear(acc)
+            for mo in T.Pipelined(T.ceildiv(M, BLOCK_M), num_stages=2):
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                    m = mo * BLOCK_M + mi
+                    d = bx * BLOCK_D + di
+                    if m < M and d < A:
+                        feature_shared[mi, di] = gg_flat_angle[m, d]
+                    else:
+                        feature_shared[mi, di] = 0
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = mo * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < M and k < K:
+                        grad_shared[mi, ki] = grad_output[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
+                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                T.sync_threads()
+            T.sync_threads()
             for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
                 d = bx * BLOCK_D + di
                 k = by * BLOCK_K + ki
-                if k < K:
-                    if d < A:
-                        acc_angle = T.alloc_var(accum_dtype, init=0)
-                        for m in T.serial(M):
-                            acc_angle += gg_flat_angle[m, d] * grad_output[m, k]
-                        grad_sub_angle[d, k] = acc_angle
-                    if d < N:
-                        acc_node = T.alloc_var(accum_dtype, init=0)
-                        for m in T.serial(M):
-                            acc_node += gg_flat_node[n2a_index[m], d] * grad_output[m, k]
-                        grad_sub_node[d, k] = acc_node
-                    if d < EK:
-                        acc_ik = T.alloc_var(accum_dtype, init=0)
-                        acc_ij = T.alloc_var(accum_dtype, init=0)
-                        for m in T.serial(M):
-                            acc_ik += gg_flat_edge[eik2a_index[m], d] * grad_output[m, k]
-                            acc_ij += gg_flat_edge[eij2a_index[m], d] * grad_output[m, k]
-                        grad_sub_edge_ik[d, k] = acc_ik
-                        grad_sub_edge_ij[d, k] = acc_ij
+                if d < A and k < K:
+                    grad_sub_angle[d, k] = acc[di, ki]
+            T.sync_threads()
+
+            # node: gathered U_x.T @ G, with row-major shared loads.
+            T.clear(acc)
+            for mo in T.Pipelined(T.ceildiv(M, BLOCK_M), num_stages=2):
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                    m = mo * BLOCK_M + mi
+                    d = bx * BLOCK_D + di
+                    if m < M and d < N:
+                        feature_shared[mi, di] = gg_flat_node[n2a_index[m], d]
+                    else:
+                        feature_shared[mi, di] = 0
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = mo * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < M and k < K:
+                        grad_shared[mi, ki] = grad_output[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
+                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                T.sync_threads()
+            T.sync_threads()
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < N and k < K:
+                    grad_sub_node[d, k] = acc[di, ki]
+            T.sync_threads()
+
+            # ik: gathered U_x.T @ G, with row-major shared loads.
+            T.clear(acc)
+            for mo in T.Pipelined(T.ceildiv(M, BLOCK_M), num_stages=2):
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                    m = mo * BLOCK_M + mi
+                    d = bx * BLOCK_D + di
+                    if m < M and d < EK:
+                        feature_shared[mi, di] = gg_flat_edge[eik2a_index[m], d]
+                    else:
+                        feature_shared[mi, di] = 0
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = mo * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < M and k < K:
+                        grad_shared[mi, ki] = grad_output[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
+                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                T.sync_threads()
+            T.sync_threads()
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < EK and k < K:
+                    grad_sub_edge_ik[d, k] = acc[di, ki]
+            T.sync_threads()
+
+            # ij: gathered U_x.T @ G, with row-major shared loads.
+            T.clear(acc)
+            for mo in T.Pipelined(T.ceildiv(M, BLOCK_M), num_stages=2):
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                    m = mo * BLOCK_M + mi
+                    d = bx * BLOCK_D + di
+                    if m < M and d < EK:
+                        feature_shared[mi, di] = gg_flat_edge[eij2a_index[m], d]
+                    else:
+                        feature_shared[mi, di] = 0
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = mo * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < M and k < K:
+                        grad_shared[mi, ki] = grad_output[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
+                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                T.sync_threads()
+            T.sync_threads()
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < EK and k < K:
+                    grad_sub_edge_ij[d, k] = acc[di, ki]
+            T.sync_threads()
 
     return double_backward_weights
 
