@@ -3441,8 +3441,12 @@ def fused_angle_update_backward_inputs(
     dtype="float32",
     accum_dtype="float32",
     THREADS=128,
+    BLOCK_M=32,
+    BLOCK_D=16,
+    BLOCK_K=32,
 ):
-    """Fuse the four activation VJPs and bias reduction."""
+    """Tiled activation VJPs; two shared tiles reused by four GEMMs."""
+    MAX_D = max(A, N, EK)
 
     @T.prim_func
     def backward_inputs(
@@ -3459,34 +3463,105 @@ def fused_angle_update_backward_inputs(
         grad_flat_edge: T.Tensor((N_EDGE, EK), accum_dtype),
         grad_bias: T.Tensor((K,), accum_dtype),
     ):
-        with T.Kernel(M, threads=THREADS) as (angle_idx,):
-            node_idx = n2a_index[angle_idx]
-            edge_ik_idx = eik2a_index[angle_idx]
-            edge_ij_idx = eij2a_index[angle_idx]
+        with T.Kernel(T.ceildiv(M, BLOCK_M), T.ceildiv(MAX_D, BLOCK_D), threads=THREADS) as (bx, by):
+            grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            weight_shared = T.alloc_shared((BLOCK_K, BLOCK_D), dtype)
+            acc_angle = T.alloc_fragment((BLOCK_M, BLOCK_D), accum_dtype)
+            T.clear(acc_angle)
+            acc_node = T.alloc_fragment((BLOCK_M, BLOCK_D), accum_dtype)
+            T.clear(acc_node)
+            acc_ik = T.alloc_fragment((BLOCK_M, BLOCK_D), accum_dtype)
+            T.clear(acc_ik)
+            acc_ij = T.alloc_fragment((BLOCK_M, BLOCK_D), accum_dtype)
+            T.clear(acc_ij)
+            bias_tile = T.alloc_fragment((BLOCK_K,), accum_dtype)
+            # for ko in T.serial(T.ceildiv(K, BLOCK_K)):
+            for ko in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = bx * BLOCK_M + mi
+                    k = ko * BLOCK_K + ki
+                    if m < M and k < K:
+                        grad_shared[mi, ki] = grad_output[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
+                # Keep grad_shared resident; reuse weight_shared for angle.
+                for ki, di in T.Parallel(BLOCK_K, BLOCK_D):
+                    k = ko * BLOCK_K + ki
+                    d = by * BLOCK_D + di
+                    if k < K and d < A:
+                        weight_shared[ki, di] = sub_angle[d, k]
+                    else:
+                        weight_shared[ki, di] = 0
+                T.sync_threads()
+                if by * BLOCK_D < A:
+                    T.gemm(grad_shared, weight_shared, acc_angle)
+                T.sync_threads()
+                # Keep grad_shared resident; reuse weight_shared for node.
+                for ki, di in T.Parallel(BLOCK_K, BLOCK_D):
+                    k = ko * BLOCK_K + ki
+                    d = by * BLOCK_D + di
+                    if k < K and d < N:
+                        weight_shared[ki, di] = sub_node[d, k]
+                    else:
+                        weight_shared[ki, di] = 0
+                T.sync_threads()
+                if by * BLOCK_D < N:
+                    T.gemm(grad_shared, weight_shared, acc_node)
+                T.sync_threads()
+                # Keep grad_shared resident; reuse weight_shared for ik.
+                for ki, di in T.Parallel(BLOCK_K, BLOCK_D):
+                    k = ko * BLOCK_K + ki
+                    d = by * BLOCK_D + di
+                    if k < K and d < EK:
+                        weight_shared[ki, di] = sub_edge_ik[d, k]
+                    else:
+                        weight_shared[ki, di] = 0
+                T.sync_threads()
+                if by * BLOCK_D < EK:
+                    T.gemm(grad_shared, weight_shared, acc_ik)
+                T.sync_threads()
+                # Keep grad_shared resident; reuse weight_shared for ij.
+                for ki, di in T.Parallel(BLOCK_K, BLOCK_D):
+                    k = ko * BLOCK_K + ki
+                    d = by * BLOCK_D + di
+                    if k < K and d < EK:
+                        weight_shared[ki, di] = sub_edge_ij[d, k]
+                    else:
+                        weight_shared[ki, di] = 0
+                T.sync_threads()
+                if by * BLOCK_D < EK:
+                    T.gemm(grad_shared, weight_shared, acc_ij)
+                T.sync_threads()
+                # Count each grad_output element exactly once across D tiles.
+                if by == 0:
+                    T.clear(bias_tile)
+                    for ki in T.Parallel(BLOCK_K):
+                        for mi in T.serial(BLOCK_M):
+                            bias_tile[ki] += T.cast(grad_shared[mi, ki], accum_dtype)
+                    for ki in T.Parallel(BLOCK_K):
+                        k = ko * BLOCK_K + ki
+                        if k < K:
+                            T.atomic_add(grad_bias[k], bias_tile[ki])
+                T.sync_threads()
 
-            for d in T.Parallel(A):
-                acc = T.alloc_var(accum_dtype, init=0)
-                for k in T.serial(K):
-                    acc += grad_output[angle_idx, k] * sub_angle[d, k]
-                grad_flat_angle[angle_idx, d] = acc
-
-            for d in T.Parallel(N):
-                acc = T.alloc_var(accum_dtype, init=0)
-                for k in T.serial(K):
-                    acc += grad_output[angle_idx, k] * sub_node[d, k]
-                T.atomic_add(grad_flat_node[node_idx, d], acc)
-
-            for d in T.Parallel(EK):
-                acc_ik = T.alloc_var(accum_dtype, init=0)
-                acc_ij = T.alloc_var(accum_dtype, init=0)
-                for k in T.serial(K):
-                    acc_ik += grad_output[angle_idx, k] * sub_edge_ik[d, k]
-                    acc_ij += grad_output[angle_idx, k] * sub_edge_ij[d, k]
-                T.atomic_add(grad_flat_edge[edge_ik_idx, d], acc_ik)
-                T.atomic_add(grad_flat_edge[edge_ij_idx, d], acc_ij)
-
-            for k in T.Parallel(K):
-                T.atomic_add(grad_bias[k], grad_output[angle_idx, k])
+            # Separate epilogues: reductions are complete before global writes.
+            for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                m = bx * BLOCK_M + mi
+                d = by * BLOCK_D + di
+                if m < M and d < A:
+                    grad_flat_angle[m, d] = acc_angle[mi, di]
+            for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                m = bx * BLOCK_M + mi
+                d = by * BLOCK_D + di
+                if m < M and d < N:
+                    T.atomic_add(grad_flat_node[n2a_index[m], d], acc_node[mi, di])
+            for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                m = bx * BLOCK_M + mi
+                d = by * BLOCK_D + di
+                if m < M and d < EK:
+                    T.atomic_add(grad_flat_edge[eik2a_index[m], d], acc_ik[mi, di])
+                    T.atomic_add(grad_flat_edge[eij2a_index[m], d], acc_ij[mi, di])
 
     return backward_inputs
 
@@ -3505,8 +3580,9 @@ def fused_angle_update_backward_weights(
     BLOCK_D=16,
     BLOCK_K=16,
     THREADS=128,
+    BLOCK_M=32,
 ):
-    """Fuse all four weight-gradient reductions."""
+    """Tiled weight VJPs; retain the gradient tile across four GEMMs."""
     MAX_D = max(A, N, EK)
 
     @T.prim_func
@@ -3523,33 +3599,95 @@ def fused_angle_update_backward_weights(
         grad_sub_edge_ik: T.Tensor((EK, K), accum_dtype),
         grad_sub_edge_ij: T.Tensor((EK, K), accum_dtype),
     ):
-        with T.Kernel(
-            T.ceildiv(MAX_D, BLOCK_D),
-            T.ceildiv(K, BLOCK_K),
-            threads=THREADS,
-        ) as (bx, by):
+        with T.Kernel(T.ceildiv(MAX_D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=THREADS) as (bx, by):
+            grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            feature_shared = T.alloc_shared((BLOCK_D, BLOCK_M), dtype)
+            acc_angle = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.clear(acc_angle)
+            acc_node = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.clear(acc_node)
+            acc_ik = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.clear(acc_ik)
+            acc_ij = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.clear(acc_ij)
+            # for mo in T.serial(T.ceildiv(M, BLOCK_M)):
+            for mo in T.Pipelined(T.ceildiv(M, BLOCK_M), num_stages=2):
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = mo * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < M and k < K:
+                        grad_shared[mi, ki] = grad_output[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
+                # Gather and transpose angle into the reused feature tile.
+                for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
+                    d = bx * BLOCK_D + di
+                    m = mo * BLOCK_M + mi
+                    if d < A and m < M:
+                        feature_shared[di, mi] = flat_angle_ebd[m, d]
+                    else:
+                        feature_shared[di, mi] = 0
+                T.sync_threads()
+                if bx * BLOCK_D < A:
+                    T.gemm(feature_shared, grad_shared, acc_angle)
+                T.sync_threads()
+                # Gather and transpose node into the reused feature tile.
+                for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
+                    d = bx * BLOCK_D + di
+                    m = mo * BLOCK_M + mi
+                    if d < N and m < M:
+                        feature_shared[di, mi] = flat_node_ebd[n2a_index[m], d]
+                    else:
+                        feature_shared[di, mi] = 0
+                T.sync_threads()
+                if bx * BLOCK_D < N:
+                    T.gemm(feature_shared, grad_shared, acc_node)
+                T.sync_threads()
+                # Gather and transpose ik into the reused feature tile.
+                for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
+                    d = bx * BLOCK_D + di
+                    m = mo * BLOCK_M + mi
+                    if d < EK and m < M:
+                        feature_shared[di, mi] = flat_edge_ebd[eik2a_index[m], d]
+                    else:
+                        feature_shared[di, mi] = 0
+                T.sync_threads()
+                if bx * BLOCK_D < EK:
+                    T.gemm(feature_shared, grad_shared, acc_ik)
+                T.sync_threads()
+                # Gather and transpose ij into the reused feature tile.
+                for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
+                    d = bx * BLOCK_D + di
+                    m = mo * BLOCK_M + mi
+                    if d < EK and m < M:
+                        feature_shared[di, mi] = flat_edge_ebd[eij2a_index[m], d]
+                    else:
+                        feature_shared[di, mi] = 0
+                T.sync_threads()
+                if bx * BLOCK_D < EK:
+                    T.gemm(feature_shared, grad_shared, acc_ij)
+                T.sync_threads()
             for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
                 d = bx * BLOCK_D + di
                 k = by * BLOCK_K + ki
-                if k < K:
-                    if d < A:
-                        acc_angle = T.alloc_var(accum_dtype, init=0)
-                        for m in T.serial(M):
-                            acc_angle += flat_angle_ebd[m, d] * grad_output[m, k]
-                        grad_sub_angle[d, k] = acc_angle
-                    if d < N:
-                        acc_node = T.alloc_var(accum_dtype, init=0)
-                        for m in T.serial(M):
-                            acc_node += flat_node_ebd[n2a_index[m], d] * grad_output[m, k]
-                        grad_sub_node[d, k] = acc_node
-                    if d < EK:
-                        acc_ik = T.alloc_var(accum_dtype, init=0)
-                        acc_ij = T.alloc_var(accum_dtype, init=0)
-                        for m in T.serial(M):
-                            acc_ik += flat_edge_ebd[eik2a_index[m], d] * grad_output[m, k]
-                            acc_ij += flat_edge_ebd[eij2a_index[m], d] * grad_output[m, k]
-                        grad_sub_edge_ik[d, k] = acc_ik
-                        grad_sub_edge_ij[d, k] = acc_ij
+                if d < A and k < K:
+                    grad_sub_angle[d, k] = acc_angle[di, ki]
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < N and k < K:
+                    grad_sub_node[d, k] = acc_node[di, ki]
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < EK and k < K:
+                    grad_sub_edge_ik[d, k] = acc_ik[di, ki]
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < EK and k < K:
+                    grad_sub_edge_ij[d, k] = acc_ij[di, ki]
 
     return backward_weights
 
