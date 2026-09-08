@@ -3445,26 +3445,49 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
         grad_grad_node_weight_input = torch.empty_like(node_weight)
         grad_grad_node_ext_weight_input = torch.empty_like(node_ext_weight)
         grad_grad_edge_weight_input = torch.empty_like(edge_weight)
-        weight_kernel = fused_edge_update_double_backward_weights(
-            E=E,
-            K=K,
-            D_edge=D_edge,
-            D_node=D_node,
-            D_ext=D_ext,
-            N_node=N_node,
-            N_ext=N_ext,
-            dtype=dtype,
+        # weight_kernel = fused_edge_update_double_backward_weights(
+        #     E=E,
+        #     K=K,
+        #     D_edge=D_edge,
+        #     D_node=D_node,
+        #     D_ext=D_ext,
+        #     N_node=N_node,
+        #     N_ext=N_ext,
+        #     dtype=dtype,
+        # )
+        # weight_kernel(
+        #     grad_out,
+        #     n2e_index,
+        #     n_ext2e_index,
+        #     grad_grad_node,
+        #     grad_grad_node_ext,
+        #     grad_grad_edge_ebd,
+        #     grad_grad_node_weight_input,
+        #     grad_grad_node_ext_weight_input,
+        #     grad_grad_edge_weight_input,
+        # )
+        # Split whole reduction tiles; keep the short edge reduction modest.
+        split_m = min(4, max(1, (E + 31) // 32))
+        workspace = torch.empty(
+            (split_m, D_node + D_ext + D_edge, K),
+            dtype=grad_out.dtype, device=grad_out.device,
         )
-        weight_kernel(
-            grad_out,
-            n2e_index,
-            n_ext2e_index,
-            grad_grad_node,
-            grad_grad_node_ext,
-            grad_grad_edge_ebd,
-            grad_grad_node_weight_input,
-            grad_grad_node_ext_weight_input,
-            grad_grad_edge_weight_input,
+        weight_kernel_v2 = fused_edge_update_double_backward_weights_v2(
+            E=E, K=K, D_edge=D_edge, D_node=D_node, D_ext=D_ext,
+            N_node=N_node, N_ext=N_ext, dtype=dtype,
+            accum_dtype=dtype, SPLIT_M=split_m,
+        )
+        weight_kernel_v2(
+            grad_out, n2e_index, n_ext2e_index,
+            grad_grad_node, grad_grad_node_ext, grad_grad_edge_ebd, workspace,
+        )
+        reduce_kernel_v2 = fused_edge_update_double_backward_weights_v2_reduce(
+            K=K, D_edge=D_edge, D_node=D_node, D_ext=D_ext,
+            SPLIT_M=split_m, accum_dtype=dtype,
+        )
+        reduce_kernel_v2(
+            workspace, grad_grad_node_weight_input,
+            grad_grad_node_ext_weight_input, grad_grad_edge_weight_input,
         )
 
         return (
@@ -4173,6 +4196,224 @@ def fused_angle_update_backward_weights_v2(
 
 @tilelang.jit
 def fused_angle_update_backward_weights_v2_reduce(
+    K, A, N, EK, SPLIT_M=8, accum_dtype="float32",
+    BLOCK_D=32, BLOCK_K=16, THREADS=128,
+):
+    """Sum partials in increasing split order and write four contiguous outputs.
+
+    No atomic additions: each output element has a unique writer and an explicit
+    serial accumulation order. This does not change the GEMM operand precision.
+    """
+    D = A + N + 2 * EK
+
+    @T.prim_func
+    def reduce_partials(
+        workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
+        grad_sub_angle: T.Tensor((A, K), accum_dtype),
+        grad_sub_node: T.Tensor((N, K), accum_dtype),
+        grad_sub_edge_ik: T.Tensor((EK, K), accum_dtype),
+        grad_sub_edge_ij: T.Tensor((EK, K), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=THREADS) as (bx, by):
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.clear(acc)
+            for split in T.serial(SPLIT_M):
+                for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                    d = bx * BLOCK_D + di
+                    k = by * BLOCK_K + ki
+                    if d < D and k < K:
+                        acc[di, ki] += workspace[split, d, k]
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < D and k < K:
+                    if d < A:
+                        grad_sub_angle[d, k] = acc[di, ki]
+                    elif d < A + N:
+                        grad_sub_node[d - A, k] = acc[di, ki]
+                    elif d < A + N + EK:
+                        grad_sub_edge_ik[d - A - N, k] = acc[di, ki]
+                    else:
+                        grad_sub_edge_ij[d - A - N - EK, k] = acc[di, ki]
+    return reduce_partials
+
+
+@tilelang.jit
+def fused_edge_update_double_backward_weights_v2(
+    E, K, D_edge, D_node, D_ext, N_node, N_ext,
+    dtype="float32", accum_dtype="float32",
+    BLOCK_D=32, BLOCK_K=16, THREADS=128, BLOCK_M=32, SPLIT_M=4,
+):
+    """Gather a logical feature concatenation and compute split-E partials.
+
+    workspace[s] = X_s.T @ G_s, X = [U_node[n2e], U_ext[n_ext2e], U_edge].
+    SPLIT_M partitions whole BLOCK_M tiles of the reduction dimension E.
+    Empty partitions explicitly write zeros. A second kernel reduces workspace.
+    No full gathered/concatenated input is materialized in global memory.
+    """
+    assert SPLIT_M > 0
+    D = D_node + D_ext + D_edge
+    TILES_PER_SPLIT = ((E + BLOCK_M - 1) // BLOCK_M + SPLIT_M - 1) // SPLIT_M
+
+    @T.prim_func
+    def weight_partials(
+        grad_out: T.Tensor((E, K), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        grad_grad_node: T.Tensor((N_node, D_node), dtype),
+        grad_grad_node_ext: T.Tensor((N_ext, D_ext), dtype),
+        grad_grad_edge_ebd: T.Tensor((E, D_edge), dtype),
+        workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), SPLIT_M, threads=THREADS) as (bx, by, bs):
+            feature_shared = T.alloc_shared((BLOCK_M, BLOCK_D), dtype)
+            grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.clear(acc)
+            for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
+                # Row-major shared layout; GEMM handles the transpose.
+                # Element guards also support feature tiles crossing segments.
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                    d = bx * BLOCK_D + di
+                    if m < E and d < D:
+                        if d < D_node:
+                            feature_shared[mi, di] = grad_grad_node[n2e_index[m], d]
+                        elif d < D_node + D_ext:
+                            feature_shared[mi, di] = grad_grad_node_ext[n_ext2e_index[m], d - D_node]
+                        else:
+                            feature_shared[mi, di] = grad_grad_edge_ebd[m, d - D_node - D_ext]
+                    else:
+                        feature_shared[mi, di] = 0
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < E and k < K:
+                        grad_shared[mi, ki] = grad_out[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
+                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                T.sync_threads()
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < D and k < K:
+                    workspace[bs, d, k] = acc[di, ki]
+    return weight_partials
+
+
+@tilelang.jit
+def fused_edge_update_double_backward_weights_v2_reduce(
+    K, D_edge, D_node, D_ext, SPLIT_M=4, accum_dtype="float32",
+    BLOCK_D=32, BLOCK_K=16, THREADS=128,
+):
+    """Sum partials in increasing split order and write three contiguous outputs.
+
+    No atomic additions: each output element has a unique writer and an explicit
+    serial accumulation order. This does not change the GEMM operand precision.
+    """
+    D = D_node + D_ext + D_edge
+
+    @T.prim_func
+    def reduce_partials(
+        workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
+        grad_node_weight: T.Tensor((D_node, K), accum_dtype),
+        grad_node_ext_weight: T.Tensor((D_ext, K), accum_dtype),
+        grad_edge_weight: T.Tensor((D_edge, K), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=THREADS) as (bx, by):
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.clear(acc)
+            for split in T.serial(SPLIT_M):
+                for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                    d = bx * BLOCK_D + di
+                    k = by * BLOCK_K + ki
+                    if d < D and k < K:
+                        acc[di, ki] += workspace[split, d, k]
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < D and k < K:
+                    if d < D_node:
+                        grad_node_weight[d, k] = acc[di, ki]
+                    elif d < D_node + D_ext:
+                        grad_node_ext_weight[d - D_node, k] = acc[di, ki]
+                    else:
+                        grad_edge_weight[d - D_node - D_ext, k] = acc[di, ki]
+    return reduce_partials
+
+
+@tilelang.jit
+def fused_angle_update_double_backward_weights_v2(
+    M, K, A, N, EK, N_NODE, N_EDGE,
+    dtype="float32", accum_dtype="float32",
+    BLOCK_D=32, BLOCK_K=16, THREADS=128, BLOCK_M=32, SPLIT_M=8,
+):
+    """Gather a logical feature concatenation and compute split-M partials.
+
+    workspace[s] = X_s.T @ G_s, X = [U_angle, U_node[n2a], U_edge[eik], U_edge[eij]].
+    SPLIT_M partitions whole BLOCK_M tiles of the reduction dimension M.
+    Empty partitions explicitly write zeros. A second kernel reduces workspace.
+    No full gathered/concatenated input is materialized in global memory.
+    """
+    assert SPLIT_M > 0
+    D = A + N + 2 * EK
+    TILES_PER_SPLIT = ((M + BLOCK_M - 1) // BLOCK_M + SPLIT_M - 1) // SPLIT_M
+
+    @T.prim_func
+    def weight_partials(
+        grad_output: T.Tensor((M, K), dtype),
+        gg_flat_angle: T.Tensor((M, A), dtype),
+        gg_flat_node: T.Tensor((N_NODE, N), dtype),
+        gg_flat_edge: T.Tensor((N_EDGE, EK), dtype),
+        n2a_index: T.Tensor((M,), "int64"),
+        eij2a_index: T.Tensor((M,), "int64"),
+        eik2a_index: T.Tensor((M,), "int64"),
+        workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), SPLIT_M, threads=THREADS) as (bx, by, bs):
+            feature_shared = T.alloc_shared((BLOCK_M, BLOCK_D), dtype)
+            grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.clear(acc)
+            for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
+                # Row-major shared layout; GEMM handles the transpose.
+                # Element guards also support feature tiles crossing segments.
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                    d = bx * BLOCK_D + di
+                    if m < M and d < D:
+                        if d < A:
+                            feature_shared[mi, di] = gg_flat_angle[m, d]
+                        elif d < A + N:
+                            feature_shared[mi, di] = gg_flat_node[n2a_index[m], d - A]
+                        elif d < A + N + EK:
+                            feature_shared[mi, di] = gg_flat_edge[eik2a_index[m], d - A - N]
+                        else:
+                            feature_shared[mi, di] = gg_flat_edge[eij2a_index[m], d - A - N - EK]
+                    else:
+                        feature_shared[mi, di] = 0
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < M and k < K:
+                        grad_shared[mi, ki] = grad_output[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
+                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                T.sync_threads()
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < D and k < K:
+                    workspace[bs, d, k] = acc[di, ki]
+    return weight_partials
+
+
+@tilelang.jit
+def fused_angle_update_double_backward_weights_v2_reduce(
     K, A, N, EK, SPLIT_M=8, accum_dtype="float32",
     BLOCK_D=32, BLOCK_K=16, THREADS=128,
 ):
@@ -5978,28 +6219,48 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
         grad_sub_node = torch.empty_like(sub_node)
         grad_sub_edge_ik = torch.empty_like(sub_edge_ik)
         grad_sub_edge_ij = torch.empty_like(sub_edge_ij)
-        weight_kernel = fused_angle_update_double_backward_weights(
-            M=M,
-            K=K,
-            A=A,
-            N=N,
-            EK=EK,
-            N_NODE=N_NODE,
-            N_EDGE=N_EDGE,
-            dtype=dtype,
+        # weight_kernel = fused_angle_update_double_backward_weights(
+        #     M=M,
+        #     K=K,
+        #     A=A,
+        #     N=N,
+        #     EK=EK,
+        #     N_NODE=N_NODE,
+        #     N_EDGE=N_EDGE,
+        #     dtype=dtype,
+        # )
+        # weight_kernel(
+        #     grad_output,
+        #     n2a_index,
+        #     eij2a_index,
+        #     eik2a_index,
+        #     grad_grad_flat_angle_ebd,
+        #     grad_grad_flat_node_ebd,
+        #     grad_grad_flat_edge_ebd,
+        #     grad_sub_angle,
+        #     grad_sub_node,
+        #     grad_sub_edge_ik,
+        #     grad_sub_edge_ij,
+        # )
+        split_m = min(8, max(1, (M + 31) // 32))
+        workspace = torch.empty(
+            (split_m, A + N + 2 * EK, K),
+            dtype=grad_output.dtype, device=grad_output.device,
         )
-        weight_kernel(
-            grad_output,
-            n2a_index,
-            eij2a_index,
-            eik2a_index,
-            grad_grad_flat_angle_ebd,
-            grad_grad_flat_node_ebd,
-            grad_grad_flat_edge_ebd,
-            grad_sub_angle,
-            grad_sub_node,
-            grad_sub_edge_ik,
-            grad_sub_edge_ij,
+        weight_kernel_v2 = fused_angle_update_double_backward_weights_v2(
+            M=M, K=K, A=A, N=N, EK=EK, N_NODE=N_NODE, N_EDGE=N_EDGE,
+            dtype=dtype, accum_dtype=dtype, SPLIT_M=split_m,
+        )
+        weight_kernel_v2(
+            grad_output, grad_grad_flat_angle_ebd, grad_grad_flat_node_ebd,
+            grad_grad_flat_edge_ebd, n2a_index, eij2a_index, eik2a_index, workspace,
+        )
+        reduce_kernel_v2 = fused_angle_update_double_backward_weights_v2_reduce(
+            K=K, A=A, N=N, EK=EK, SPLIT_M=split_m, accum_dtype=dtype,
+        )
+        reduce_kernel_v2(
+            workspace, grad_sub_angle, grad_sub_node,
+            grad_sub_edge_ik, grad_sub_edge_ij,
         )
 
         return (
