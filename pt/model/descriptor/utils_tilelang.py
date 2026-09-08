@@ -3618,7 +3618,7 @@ def fused_angle_update_backward_weights(
     N_EDGE,
     dtype="float32",
     accum_dtype="float32",
-    BLOCK_D=16,
+    BLOCK_D=32,
     BLOCK_K=16,
     THREADS=128,
     BLOCK_M=32,
