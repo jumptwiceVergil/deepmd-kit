@@ -3475,7 +3475,8 @@ def fused_angle_update_backward_inputs(
             acc_ij = T.alloc_fragment((BLOCK_M, BLOCK_D), accum_dtype)
             T.clear(acc_ij)
             bias_tile = T.alloc_fragment((BLOCK_K,), accum_dtype)
-            # for ko in T.serial(T.ceildiv(K, BLOCK_K)):
+
+            # Independent angle pipeline: reload grad_output for this GEMM.
             for ko in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
                 for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
                     m = bx * BLOCK_M + mi
@@ -3485,7 +3486,6 @@ def fused_angle_update_backward_inputs(
                     else:
                         grad_shared[mi, ki] = 0
                 T.sync_threads()
-                # Keep grad_shared resident; reuse weight_shared for angle.
                 for ki, di in T.Parallel(BLOCK_K, BLOCK_D):
                     k = ko * BLOCK_K + ki
                     d = by * BLOCK_D + di
@@ -3497,7 +3497,18 @@ def fused_angle_update_backward_inputs(
                 if by * BLOCK_D < A:
                     T.gemm(grad_shared, weight_shared, acc_angle)
                 T.sync_threads()
-                # Keep grad_shared resident; reuse weight_shared for node.
+            T.sync_threads()
+
+            # Independent node pipeline: reload grad_output for this GEMM.
+            for ko in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = bx * BLOCK_M + mi
+                    k = ko * BLOCK_K + ki
+                    if m < M and k < K:
+                        grad_shared[mi, ki] = grad_output[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
                 for ki, di in T.Parallel(BLOCK_K, BLOCK_D):
                     k = ko * BLOCK_K + ki
                     d = by * BLOCK_D + di
@@ -3509,7 +3520,18 @@ def fused_angle_update_backward_inputs(
                 if by * BLOCK_D < N:
                     T.gemm(grad_shared, weight_shared, acc_node)
                 T.sync_threads()
-                # Keep grad_shared resident; reuse weight_shared for ik.
+            T.sync_threads()
+
+            # Independent ik pipeline: reload grad_output for this GEMM.
+            for ko in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = bx * BLOCK_M + mi
+                    k = ko * BLOCK_K + ki
+                    if m < M and k < K:
+                        grad_shared[mi, ki] = grad_output[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
                 for ki, di in T.Parallel(BLOCK_K, BLOCK_D):
                     k = ko * BLOCK_K + ki
                     d = by * BLOCK_D + di
@@ -3521,7 +3543,18 @@ def fused_angle_update_backward_inputs(
                 if by * BLOCK_D < EK:
                     T.gemm(grad_shared, weight_shared, acc_ik)
                 T.sync_threads()
-                # Keep grad_shared resident; reuse weight_shared for ij.
+            T.sync_threads()
+
+            # Independent ij pipeline: reload grad_output for this GEMM.
+            for ko in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = bx * BLOCK_M + mi
+                    k = ko * BLOCK_K + ki
+                    if m < M and k < K:
+                        grad_shared[mi, ki] = grad_output[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
                 for ki, di in T.Parallel(BLOCK_K, BLOCK_D):
                     k = ko * BLOCK_K + ki
                     d = by * BLOCK_D + di
@@ -3533,17 +3566,25 @@ def fused_angle_update_backward_inputs(
                 if by * BLOCK_D < EK:
                     T.gemm(grad_shared, weight_shared, acc_ij)
                 T.sync_threads()
-                # Count each grad_output element exactly once across D tiles.
-                if by == 0:
+            T.sync_threads()
+
+            # Bias is reduced once, outside the four GEMM pipelines.
+            # Read global memory here: a pipelined shared tile must not be
+            # consumed after the loop that versions it.
+            if by == 0:
+                for ko in T.serial(T.ceildiv(K, BLOCK_K)):
                     T.clear(bias_tile)
                     for ki in T.Parallel(BLOCK_K):
-                        for mi in T.serial(BLOCK_M):
-                            bias_tile[ki] += T.cast(grad_shared[mi, ki], accum_dtype)
+                        k = ko * BLOCK_K + ki
+                        if k < K:
+                            for mi in T.serial(BLOCK_M):
+                                m = bx * BLOCK_M + mi
+                                if m < M:
+                                    bias_tile[ki] += T.cast(grad_output[m, k], accum_dtype)
                     for ki in T.Parallel(BLOCK_K):
                         k = ko * BLOCK_K + ki
                         if k < K:
                             T.atomic_add(grad_bias[k], bias_tile[ki])
-                T.sync_threads()
 
             # Separate epilogues: reductions are complete before global writes.
             for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
@@ -3582,7 +3623,7 @@ def fused_angle_update_backward_weights(
     THREADS=128,
     BLOCK_M=32,
 ):
-    """Tiled weight VJPs; retain the gradient tile across four GEMMs."""
+    """Four independent GEMM pipelines sharing two scratch allocations."""
     MAX_D = max(A, N, EK)
 
     @T.prim_func
@@ -3610,7 +3651,8 @@ def fused_angle_update_backward_weights(
             T.clear(acc_ik)
             acc_ij = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
             T.clear(acc_ij)
-            # for mo in T.serial(T.ceildiv(M, BLOCK_M)):
+
+            # Independent angle pipeline: reload grad_output for this GEMM.
             for mo in T.Pipelined(T.ceildiv(M, BLOCK_M), num_stages=2):
                 for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
                     m = mo * BLOCK_M + mi
@@ -3620,7 +3662,6 @@ def fused_angle_update_backward_weights(
                     else:
                         grad_shared[mi, ki] = 0
                 T.sync_threads()
-                # Gather and transpose angle into the reused feature tile.
                 for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
                     d = bx * BLOCK_D + di
                     m = mo * BLOCK_M + mi
@@ -3632,7 +3673,18 @@ def fused_angle_update_backward_weights(
                 if bx * BLOCK_D < A:
                     T.gemm(feature_shared, grad_shared, acc_angle)
                 T.sync_threads()
-                # Gather and transpose node into the reused feature tile.
+            T.sync_threads()
+
+            # Independent node pipeline: reload grad_output for this GEMM.
+            for mo in T.Pipelined(T.ceildiv(M, BLOCK_M), num_stages=2):
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = mo * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < M and k < K:
+                        grad_shared[mi, ki] = grad_output[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
                 for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
                     d = bx * BLOCK_D + di
                     m = mo * BLOCK_M + mi
@@ -3644,7 +3696,18 @@ def fused_angle_update_backward_weights(
                 if bx * BLOCK_D < N:
                     T.gemm(feature_shared, grad_shared, acc_node)
                 T.sync_threads()
-                # Gather and transpose ik into the reused feature tile.
+            T.sync_threads()
+
+            # Independent ik pipeline: reload grad_output for this GEMM.
+            for mo in T.Pipelined(T.ceildiv(M, BLOCK_M), num_stages=2):
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = mo * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < M and k < K:
+                        grad_shared[mi, ki] = grad_output[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
                 for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
                     d = bx * BLOCK_D + di
                     m = mo * BLOCK_M + mi
@@ -3656,7 +3719,18 @@ def fused_angle_update_backward_weights(
                 if bx * BLOCK_D < EK:
                     T.gemm(feature_shared, grad_shared, acc_ik)
                 T.sync_threads()
-                # Gather and transpose ij into the reused feature tile.
+            T.sync_threads()
+
+            # Independent ij pipeline: reload grad_output for this GEMM.
+            for mo in T.Pipelined(T.ceildiv(M, BLOCK_M), num_stages=2):
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = mo * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < M and k < K:
+                        grad_shared[mi, ki] = grad_output[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
                 for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
                     d = bx * BLOCK_D + di
                     m = mo * BLOCK_M + mi
@@ -3668,6 +3742,8 @@ def fused_angle_update_backward_weights(
                 if bx * BLOCK_D < EK:
                     T.gemm(feature_shared, grad_shared, acc_ij)
                 T.sync_threads()
+            T.sync_threads()
+
             for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
                 d = bx * BLOCK_D + di
                 k = by * BLOCK_K + ki
@@ -5062,4 +5138,3 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
             grad_sub_edge_ij,       # 10 sub_edge_ij
             None,                   # 11 node_ebd_shape
         )
-
