@@ -3623,7 +3623,12 @@ def fused_angle_update_backward_weights(
     THREADS=128,
     BLOCK_M=32,
 ):
-    """Four independent GEMM pipelines sharing two scratch allocations."""
+    """Four independent GEMM pipelines sharing two scratch allocations.
+
+    Load features in row-major order; GEMM performs X.T @ grad_output.
+    Keeping the inner load dimension contiguous avoids transposed gathers
+    across the angle-index dimension during vectorization planning.
+    """
     MAX_D = max(A, N, EK)
 
     @T.prim_func
@@ -3642,7 +3647,8 @@ def fused_angle_update_backward_weights(
     ):
         with T.Kernel(T.ceildiv(MAX_D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=THREADS) as (bx, by):
             grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
-            feature_shared = T.alloc_shared((BLOCK_D, BLOCK_M), dtype)
+            # Original: feature_shared = T.alloc_shared((BLOCK_D, BLOCK_M), dtype)
+            feature_shared = T.alloc_shared((BLOCK_M, BLOCK_D), dtype)
             acc_angle = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
             T.clear(acc_angle)
             acc_node = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
@@ -3662,16 +3668,20 @@ def fused_angle_update_backward_weights(
                     else:
                         grad_shared[mi, ki] = 0
                 T.sync_threads()
-                for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
+                # Original: for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
                     d = bx * BLOCK_D + di
                     m = mo * BLOCK_M + mi
                     if d < A and m < M:
-                        feature_shared[di, mi] = flat_angle_ebd[m, d]
+                        # Original: feature_shared[di, mi] = flat_angle_ebd[m, d]
+                        feature_shared[mi, di] = flat_angle_ebd[m, d]
                     else:
-                        feature_shared[di, mi] = 0
+                        # Original: feature_shared[di, mi] = 0
+                        feature_shared[mi, di] = 0
                 T.sync_threads()
                 if bx * BLOCK_D < A:
-                    T.gemm(feature_shared, grad_shared, acc_angle)
+                    # Original: T.gemm(feature_shared, grad_shared, acc_angle)
+                    T.gemm(feature_shared, grad_shared, acc_angle, transpose_A=True)
                 T.sync_threads()
             T.sync_threads()
 
@@ -3685,16 +3695,20 @@ def fused_angle_update_backward_weights(
                     else:
                         grad_shared[mi, ki] = 0
                 T.sync_threads()
-                for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
+                # Original: for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
                     d = bx * BLOCK_D + di
                     m = mo * BLOCK_M + mi
                     if d < N and m < M:
-                        feature_shared[di, mi] = flat_node_ebd[n2a_index[m], d]
+                        # Original: feature_shared[di, mi] = flat_node_ebd[n2a_index[m], d]
+                        feature_shared[mi, di] = flat_node_ebd[n2a_index[m], d]
                     else:
-                        feature_shared[di, mi] = 0
+                        # Original: feature_shared[di, mi] = 0
+                        feature_shared[mi, di] = 0
                 T.sync_threads()
                 if bx * BLOCK_D < N:
-                    T.gemm(feature_shared, grad_shared, acc_node)
+                    # Original: T.gemm(feature_shared, grad_shared, acc_node)
+                    T.gemm(feature_shared, grad_shared, acc_node, transpose_A=True)
                 T.sync_threads()
             T.sync_threads()
 
@@ -3708,16 +3722,20 @@ def fused_angle_update_backward_weights(
                     else:
                         grad_shared[mi, ki] = 0
                 T.sync_threads()
-                for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
+                # Original: for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
                     d = bx * BLOCK_D + di
                     m = mo * BLOCK_M + mi
                     if d < EK and m < M:
-                        feature_shared[di, mi] = flat_edge_ebd[eik2a_index[m], d]
+                        # Original: feature_shared[di, mi] = flat_edge_ebd[eik2a_index[m], d]
+                        feature_shared[mi, di] = flat_edge_ebd[eik2a_index[m], d]
                     else:
-                        feature_shared[di, mi] = 0
+                        # Original: feature_shared[di, mi] = 0
+                        feature_shared[mi, di] = 0
                 T.sync_threads()
                 if bx * BLOCK_D < EK:
-                    T.gemm(feature_shared, grad_shared, acc_ik)
+                    # Original: T.gemm(feature_shared, grad_shared, acc_ik)
+                    T.gemm(feature_shared, grad_shared, acc_ik, transpose_A=True)
                 T.sync_threads()
             T.sync_threads()
 
@@ -3731,16 +3749,20 @@ def fused_angle_update_backward_weights(
                     else:
                         grad_shared[mi, ki] = 0
                 T.sync_threads()
-                for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
+                # Original: for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
                     d = bx * BLOCK_D + di
                     m = mo * BLOCK_M + mi
                     if d < EK and m < M:
-                        feature_shared[di, mi] = flat_edge_ebd[eij2a_index[m], d]
+                        # Original: feature_shared[di, mi] = flat_edge_ebd[eij2a_index[m], d]
+                        feature_shared[mi, di] = flat_edge_ebd[eij2a_index[m], d]
                     else:
-                        feature_shared[di, mi] = 0
+                        # Original: feature_shared[di, mi] = 0
+                        feature_shared[mi, di] = 0
                 T.sync_threads()
                 if bx * BLOCK_D < EK:
-                    T.gemm(feature_shared, grad_shared, acc_ij)
+                    # Original: T.gemm(feature_shared, grad_shared, acc_ij)
+                    T.gemm(feature_shared, grad_shared, acc_ij, transpose_A=True)
                 T.sync_threads()
             T.sync_threads()
 
