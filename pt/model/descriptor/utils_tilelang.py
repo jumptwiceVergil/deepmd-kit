@@ -2659,6 +2659,199 @@ def fused_edge_update_input_backward_v1(
 
 
 @tilelang.jit
+def fused_edge_update_weight_backward_v2(
+    E, K, D_edge, D_node, D_ext, N_node, N_ext,
+    dtype="float32", accum_dtype="float32",
+    BLOCK_D=32, BLOCK_K=16, THREADS=128, BLOCK_M=32, SPLIT_M=4,
+):
+    """Gather a logical feature concatenation and compute split-E partials.
+
+    workspace[s] = X_s.T @ G_s, X = [node[n2e], node_ext[n_ext2e], edge].
+    SPLIT_M partitions whole BLOCK_M tiles of the reduction dimension E.
+    Empty partitions explicitly write zeros. A second kernel reduces workspace.
+    No full gathered/concatenated input is materialized in global memory.
+    """
+    assert SPLIT_M > 0
+    D = D_node + D_ext + D_edge
+    TILES_PER_SPLIT = ((E + BLOCK_M - 1) // BLOCK_M + SPLIT_M - 1) // SPLIT_M
+
+    @T.prim_func
+    def weight_partials(
+        grad_out: T.Tensor((E, K), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        node_ebd: T.Tensor((N_node, D_node), dtype),
+        node_ebd_ext: T.Tensor((N_ext, D_ext), dtype),
+        flat_edge_ebd: T.Tensor((E, D_edge), dtype),
+        workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), SPLIT_M, threads=THREADS) as (bx, by, bs):
+            feature_shared = T.alloc_shared((BLOCK_M, BLOCK_D), dtype)
+            grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.clear(acc)
+            for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
+                # Row-major shared layout; GEMM handles the transpose.
+                # Element guards also support feature tiles crossing segments.
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                    d = bx * BLOCK_D + di
+                    if m < E and d < D:
+                        if d < D_node:
+                            feature_shared[mi, di] = node_ebd[n2e_index[m], d]
+                        elif d < D_node + D_ext:
+                            feature_shared[mi, di] = node_ebd_ext[n_ext2e_index[m], d - D_node]
+                        else:
+                            feature_shared[mi, di] = flat_edge_ebd[m, d - D_node - D_ext]
+                    else:
+                        feature_shared[mi, di] = 0
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < E and k < K:
+                        grad_shared[mi, ki] = grad_out[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
+                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                T.sync_threads()
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < D and k < K:
+                    workspace[bs, d, k] = acc[di, ki]
+    return weight_partials
+
+
+@tilelang.jit
+def fused_edge_update_weight_backward_v2_reduce(
+    K, D_edge, D_node, D_ext, SPLIT_M=4, accum_dtype="float32",
+    BLOCK_D=32, BLOCK_K=16, THREADS=128,
+):
+    """Sum partials in increasing split order and write three contiguous outputs.
+
+    No atomic additions: each output element has a unique writer and an explicit
+    serial accumulation order. This does not change the GEMM operand precision.
+    """
+    D = D_node + D_ext + D_edge
+
+    @T.prim_func
+    def reduce_partials(
+        workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
+        grad_node_weight: T.Tensor((D_node, K), accum_dtype),
+        grad_node_ext_weight: T.Tensor((D_ext, K), accum_dtype),
+        grad_edge_weight: T.Tensor((D_edge, K), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), threads=THREADS) as (bx, by):
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.clear(acc)
+            for split in T.serial(SPLIT_M):
+                for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                    d = bx * BLOCK_D + di
+                    k = by * BLOCK_K + ki
+                    if d < D and k < K:
+                        acc[di, ki] += workspace[split, d, k]
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < D and k < K:
+                    if d < D_node:
+                        grad_node_weight[d, k] = acc[di, ki]
+                    elif d < D_node + D_ext:
+                        grad_node_ext_weight[d - D_node, k] = acc[di, ki]
+                    else:
+                        grad_edge_weight[d - D_node - D_ext, k] = acc[di, ki]
+    return reduce_partials
+
+
+@tilelang.jit
+def fused_edge_update_input_backward_v2(
+    E, K, D_edge, D_node, D_ext, N_node, N_ext,
+    dtype="float32", accum_dtype="float32",
+    BLOCK_E=32, BLOCK_D=32, BLOCK_K=32, THREADS=128,
+):
+    """Compute G @ [W_edge; W_node; W_ext].T without materializing concat.
+
+    Node/ext outputs and bias must be zero-initialized before launch.
+    Arbitrary repeated/unordered indices are supported. Each direct edge
+    output is uniquely written; node/ext contributions use scatter-add.
+    """
+    D = D_edge + D_node + D_ext
+
+    @T.prim_func
+    def input_backward(
+        grad_out: T.Tensor((E, K), dtype),
+        edge_weight: T.Tensor((D_edge, K), dtype),
+        node_weight: T.Tensor((D_node, K), dtype),
+        node_ext_weight: T.Tensor((D_ext, K), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        grad_edge_ebd: T.Tensor((E, D_edge), accum_dtype),
+        grad_node: T.Tensor((N_node, D_node), accum_dtype),
+        grad_node_ext: T.Tensor((N_ext, D_ext), accum_dtype),
+        grad_bias: T.Tensor((K,), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(E, BLOCK_E), T.ceildiv(D, BLOCK_D), threads=THREADS) as (bx, by):
+            grad_shared = T.alloc_shared((BLOCK_E, BLOCK_K), dtype)
+            weight_shared = T.alloc_shared((BLOCK_K, BLOCK_D), dtype)
+            acc = T.alloc_fragment((BLOCK_E, BLOCK_D), accum_dtype)
+            bias_tile = T.alloc_fragment((BLOCK_K,), accum_dtype)
+            T.clear(acc)
+            for ko in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                for ei, ki in T.Parallel(BLOCK_E, BLOCK_K):
+                    e = bx * BLOCK_E + ei
+                    k = ko * BLOCK_K + ki
+                    if e < E and k < K:
+                        grad_shared[ei, ki] = grad_out[e, k]
+                    else:
+                        grad_shared[ei, ki] = 0
+                for ki, di in T.Parallel(BLOCK_K, BLOCK_D):
+                    k = ko * BLOCK_K + ki
+                    d = by * BLOCK_D + di
+                    if k < K and d < D:
+                        if d < D_edge:
+                            weight_shared[ki, di] = edge_weight[d, k]
+                        elif d < D_edge + D_node:
+                            weight_shared[ki, di] = node_weight[d - D_edge, k]
+                        else:
+                            weight_shared[ki, di] = node_ext_weight[d - D_edge - D_node, k]
+                    else:
+                        weight_shared[ki, di] = 0
+                T.sync_threads()
+                T.gemm(grad_shared, weight_shared, acc)
+                T.sync_threads()
+            # Separate writeback; gather's adjoint is scatter-add, not a split.
+            for ei, di in T.Parallel(BLOCK_E, BLOCK_D):
+                e = bx * BLOCK_E + ei
+                d = by * BLOCK_D + di
+                if e < E and d < D:
+                    if d < D_edge:
+                        grad_edge_ebd[e, d] = acc[ei, di]
+                    elif d < D_edge + D_node:
+                        T.atomic_add(grad_node[n2e_index[e], d - D_edge], acc[ei, di])
+                    else:
+                        T.atomic_add(grad_node_ext[n_ext2e_index[e], d - D_edge - D_node], acc[ei, di])
+            # Bias is independent of feature segments and GEMM multibuffering.
+            # Exactly one feature block per edge tile contributes. Reset for
+            # EVERY K tile: carrying the previous tile corrupts K > BLOCK_K.
+            if by == 0:
+                for ko in T.serial(T.ceildiv(K, BLOCK_K)):
+                    T.clear(bias_tile)
+                    for ki in T.Parallel(BLOCK_K):
+                        k = ko * BLOCK_K + ki
+                        if k < K:
+                            for ei in T.serial(BLOCK_E):
+                                e = bx * BLOCK_E + ei
+                                if e < E:
+                                    bias_tile[ki] += grad_out[e, k]
+                    for ki in T.Parallel(BLOCK_K):
+                        k = ko * BLOCK_K + ki
+                        if k < K:
+                            T.atomic_add(grad_bias[k], bias_tile[ki])
+    return input_backward
+
+
+@tilelang.jit
 def fused_edge_update_double_backward_inputs(
     E,
     K,
@@ -3213,26 +3406,48 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
             dtype=grad_out.dtype,
         )
 
-        weight_kernel = fused_edge_update_weight_backward_v1(
-            E=E,
-            K=K,
-            D_edge=D_edge,
-            N_node=N_node,
-            D_node=D_node,
-            N_ext=N_ext,
-            D_ext=D_ext,
+        # weight_kernel = fused_edge_update_weight_backward_v1(
+        #     E=E,
+        #     K=K,
+        #     D_edge=D_edge,
+        #     N_node=N_node,
+        #     D_node=D_node,
+        #     N_ext=N_ext,
+        #     D_ext=D_ext,
+        # )
+        #
+        # weight_kernel(
+        #     grad_out,
+        #     flat_edge_ebd,
+        #     node_ebd,
+        #     node_ebd_ext,
+        #     n2e_index,
+        #     n_ext2e_index,
+        #     grad_edge_weight,
+        #     grad_node_weight,
+        #     grad_node_ext_weight,
+        # )
+        dtype = str(grad_out.dtype).replace("torch.", "")
+        split_m = min(4, max(1, (E + 31) // 32))
+        workspace = torch.empty(
+            (split_m, D_node + D_ext + D_edge, K),
+            device=grad_out.device, dtype=grad_out.dtype,
         )
-
-        weight_kernel(
-            grad_out,
-            flat_edge_ebd,
-            node_ebd,
-            node_ebd_ext,
-            n2e_index,
-            n_ext2e_index,
-            grad_edge_weight,
-            grad_node_weight,
-            grad_node_ext_weight,
+        weight_kernel_v2 = fused_edge_update_weight_backward_v2(
+            E=E, K=K, D_edge=D_edge, D_node=D_node, D_ext=D_ext,
+            N_node=N_node, N_ext=N_ext, dtype=dtype, accum_dtype=dtype,
+            SPLIT_M=split_m,
+        )
+        weight_kernel_v2(
+            grad_out, n2e_index, n_ext2e_index,
+            node_ebd, node_ebd_ext, flat_edge_ebd, workspace,
+        )
+        weight_reduce_v2 = fused_edge_update_weight_backward_v2_reduce(
+            K=K, D_edge=D_edge, D_node=D_node, D_ext=D_ext,
+            SPLIT_M=split_m, accum_dtype=dtype,
+        )
+        weight_reduce_v2(
+            workspace, grad_node_weight, grad_node_ext_weight, grad_edge_weight,
         )
 
         grad_edge_ebd = torch.empty(
@@ -3259,7 +3474,29 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
             dtype=grad_out.dtype,
         )
 
-        input_kernel = fused_edge_update_input_backward_v1(
+        # input_kernel = fused_edge_update_input_backward_v1(
+        #     E=E,
+        #     K=K,
+        #     D_edge=D_edge,
+        #     D_node=D_node,
+        #     D_ext=D_ext,
+        #     N_node=N_node,
+        #     N_ext=N_ext,
+        # )
+        #
+        # input_kernel(
+        #     grad_out,
+        #     edge_weight,
+        #     node_weight,
+        #     node_ext_weight,
+        #     n2e_index,
+        #     n_ext2e_index,
+        #     grad_edge_ebd,
+        #     grad_node,
+        #     grad_node_ext,
+        #     grad_bias,
+        # )
+        input_kernel = fused_edge_update_input_backward_v2(
             E=E,
             K=K,
             D_edge=D_edge,
@@ -3267,6 +3504,7 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
             D_ext=D_ext,
             N_node=N_node,
             N_ext=N_ext,
+            dtype=dtype, accum_dtype=dtype,
         )
 
         input_kernel(
