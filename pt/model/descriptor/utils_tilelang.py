@@ -2673,8 +2673,13 @@ def fused_edge_update_double_backward_inputs(
     BLOCK_M=32,
     BLOCK_N=32,
     BLOCK_K=32,
+    HAS_NODE=True, HAS_EXT=True, HAS_EDGE=True, HAS_NODE_WEIGHT=True, HAS_EXT_WEIGHT=True, HAS_EDGE_WEIGHT=True, HAS_BIAS=True,
 ):
-    """Fuse grad-grad-output and all three input-side VJPs."""
+    """Fuse grad-grad-output and all three input-side VJPs.
+
+    HAS_* are JIT specialization flags, not device tensor arguments. An absent
+    cotangent's pointer is never read. Scatter outputs must still start at zero.
+    """
 
     @T.prim_func
     def double_backward_inputs(
@@ -2751,149 +2756,159 @@ def fused_edge_update_double_backward_inputs(
             T.clear(acc_output)
             if by * BLOCK_N < K:
                 # edge: U_x W and X U_w; each has its own pipeline.
-                for ro in T.Pipelined(T.ceildiv(D_edge, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < E and r < D_edge:
-                            lhs_shared[mi, ri] = grad_grad_edge_ebd[m, r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < D_edge and n < K:
-                            rhs_shared[ri, ni] = edge_weight[r, n]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_output)
-                    T.sync_threads()
+                if HAS_EDGE:
+                    for ro in T.Pipelined(T.ceildiv(D_edge, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < E and r < D_edge:
+                                lhs_shared[mi, ri] = grad_grad_edge_ebd[m, r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < D_edge and n < K:
+                                rhs_shared[ri, ni] = edge_weight[r, n]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_output)
+                        T.sync_threads()
                 T.sync_threads()
-                for ro in T.Pipelined(T.ceildiv(D_edge, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < E and r < D_edge:
-                            lhs_shared[mi, ri] = flat_edge_ebd[m, r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < D_edge and n < K:
-                            rhs_shared[ri, ni] = grad_grad_edge_weight[r, n]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_output)
-                    T.sync_threads()
+                if HAS_EDGE_WEIGHT:
+                    for ro in T.Pipelined(T.ceildiv(D_edge, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < E and r < D_edge:
+                                lhs_shared[mi, ri] = flat_edge_ebd[m, r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < D_edge and n < K:
+                                rhs_shared[ri, ni] = grad_grad_edge_weight[r, n]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_output)
+                        T.sync_threads()
                 T.sync_threads()
                 # node: U_x W and X U_w; each has its own pipeline.
-                for ro in T.Pipelined(T.ceildiv(D_node, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < E and r < D_node:
-                            lhs_shared[mi, ri] = grad_grad_node[n2e_index[m], r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < D_node and n < K:
-                            rhs_shared[ri, ni] = node_weight[r, n]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_output)
-                    T.sync_threads()
+                if HAS_NODE:
+                    for ro in T.Pipelined(T.ceildiv(D_node, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < E and r < D_node:
+                                lhs_shared[mi, ri] = grad_grad_node[n2e_index[m], r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < D_node and n < K:
+                                rhs_shared[ri, ni] = node_weight[r, n]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_output)
+                        T.sync_threads()
                 T.sync_threads()
-                for ro in T.Pipelined(T.ceildiv(D_node, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < E and r < D_node:
-                            lhs_shared[mi, ri] = node_ebd[n2e_index[m], r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < D_node and n < K:
-                            rhs_shared[ri, ni] = grad_grad_node_weight[r, n]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_output)
-                    T.sync_threads()
+                if HAS_NODE_WEIGHT:
+                    for ro in T.Pipelined(T.ceildiv(D_node, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < E and r < D_node:
+                                lhs_shared[mi, ri] = node_ebd[n2e_index[m], r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < D_node and n < K:
+                                rhs_shared[ri, ni] = grad_grad_node_weight[r, n]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_output)
+                        T.sync_threads()
                 T.sync_threads()
                 # ext: U_x W and X U_w; each has its own pipeline.
-                for ro in T.Pipelined(T.ceildiv(D_ext, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < E and r < D_ext:
-                            lhs_shared[mi, ri] = grad_grad_node_ext[n_ext2e_index[m], r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < D_ext and n < K:
-                            rhs_shared[ri, ni] = node_ext_weight[r, n]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_output)
-                    T.sync_threads()
+                if HAS_EXT:
+                    for ro in T.Pipelined(T.ceildiv(D_ext, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < E and r < D_ext:
+                                lhs_shared[mi, ri] = grad_grad_node_ext[n_ext2e_index[m], r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < D_ext and n < K:
+                                rhs_shared[ri, ni] = node_ext_weight[r, n]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_output)
+                        T.sync_threads()
                 T.sync_threads()
-                for ro in T.Pipelined(T.ceildiv(D_ext, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < E and r < D_ext:
-                            lhs_shared[mi, ri] = node_ebd_ext[n_ext2e_index[m], r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < D_ext and n < K:
-                            rhs_shared[ri, ni] = grad_grad_node_ext_weight[r, n]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_output)
-                    T.sync_threads()
+                if HAS_EXT_WEIGHT:
+                    for ro in T.Pipelined(T.ceildiv(D_ext, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < E and r < D_ext:
+                                lhs_shared[mi, ri] = node_ebd_ext[n_ext2e_index[m], r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < D_ext and n < K:
+                                rhs_shared[ri, ni] = grad_grad_node_ext_weight[r, n]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_output)
+                        T.sync_threads()
                 T.sync_threads()
             for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
                 m = bx * BLOCK_M + mi
                 n = by * BLOCK_N + ni
                 if m < E and n < K:
-                    grad_grad_out[m, n] = acc_output[mi, ni] + grad_grad_bias[n]
+                    if HAS_BIAS:
+                        grad_grad_out[m, n] = acc_output[mi, ni] + grad_grad_bias[n]
+                    else:
+                        grad_grad_out[m, n] = acc_output[mi, ni]
 
             # edge input VJP: G U_w.T; reuse the fragment after writeback.
             if by * BLOCK_N < D_edge:
                 T.clear(acc_input)
-                for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < E and r < K:
-                            lhs_shared[mi, ri] = grad_out[m, r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < K and n < D_edge:
-                            rhs_shared[ri, ni] = grad_grad_edge_weight[n, r]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_input)
-                    T.sync_threads()
+                if HAS_EDGE_WEIGHT:
+                    for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < E and r < K:
+                                lhs_shared[mi, ri] = grad_out[m, r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < K and n < D_edge:
+                                rhs_shared[ri, ni] = grad_grad_edge_weight[n, r]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_input)
+                        T.sync_threads()
                 T.sync_threads()
                 for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
                     m = bx * BLOCK_M + mi
@@ -2902,27 +2917,28 @@ def fused_edge_update_double_backward_inputs(
                         grad_flat_edge_ebd[m, n] = acc_input[mi, ni]
                 T.sync_threads()
 
-            # node input VJP: G U_w.T; reuse the fragment after writeback.
-            if by * BLOCK_N < D_node:
+            # node input VJP: missing cotangent leaves the zeroed output unchanged.
+            if HAS_NODE_WEIGHT and by * BLOCK_N < D_node:
                 T.clear(acc_input)
-                for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < E and r < K:
-                            lhs_shared[mi, ri] = grad_out[m, r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < K and n < D_node:
-                            rhs_shared[ri, ni] = grad_grad_node_weight[n, r]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_input)
-                    T.sync_threads()
+                if HAS_NODE_WEIGHT:
+                    for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < E and r < K:
+                                lhs_shared[mi, ri] = grad_out[m, r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < K and n < D_node:
+                                rhs_shared[ri, ni] = grad_grad_node_weight[n, r]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_input)
+                        T.sync_threads()
                 T.sync_threads()
                 for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
                     m = bx * BLOCK_M + mi
@@ -2931,27 +2947,28 @@ def fused_edge_update_double_backward_inputs(
                         T.atomic_add(grad_node_ebd[n2e_index[m], n], acc_input[mi, ni])
                 T.sync_threads()
 
-            # ext input VJP: G U_w.T; reuse the fragment after writeback.
-            if by * BLOCK_N < D_ext:
+            # ext input VJP: missing cotangent leaves the zeroed output unchanged.
+            if HAS_EXT_WEIGHT and by * BLOCK_N < D_ext:
                 T.clear(acc_input)
-                for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < E and r < K:
-                            lhs_shared[mi, ri] = grad_out[m, r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < K and n < D_ext:
-                            rhs_shared[ri, ni] = grad_grad_node_ext_weight[n, r]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_input)
-                    T.sync_threads()
+                if HAS_EXT_WEIGHT:
+                    for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < E and r < K:
+                                lhs_shared[mi, ri] = grad_out[m, r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < K and n < D_ext:
+                                rhs_shared[ri, ni] = grad_grad_node_ext_weight[n, r]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_input)
+                        T.sync_threads()
                 T.sync_threads()
                 for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
                     m = bx * BLOCK_M + mi
@@ -3265,6 +3282,8 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
             grad_bias,
         )
 
+        # Preserve undefined second-order cotangents instead of autograd zeros.
+        ctx.set_materialize_grads(False)
         ctx.save_for_backward(
             grad_out,
             node_ebd,
@@ -3380,31 +3399,48 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
         _, D_edge = flat_edge_ebd.shape
         dtype = str(grad_out.dtype).replace("torch.", "")
 
-        # Use zero cotangents for outputs that were not used by the caller.
-        optional_grads = (
-            ("grad_grad_node", grad_grad_node, node_ebd),
-            ("grad_grad_node_ext", grad_grad_node_ext, node_ebd_ext),
-            ("grad_grad_edge_ebd", grad_grad_edge_ebd, flat_edge_ebd),
-            ("grad_grad_node_weight", grad_grad_node_weight, node_weight),
-            ("grad_grad_node_ext_weight", grad_grad_node_ext_weight, node_ext_weight),
-            ("grad_grad_edge_weight", grad_grad_edge_weight, edge_weight),
-        )
-        materialized = {
-            name: torch.zeros_like(reference) if value is None else value.contiguous()
-            for name, value, reference in optional_grads
-        }
-        if grad_grad_bias is None:
-            grad_grad_bias = torch.zeros((K,), device=grad_out.device, dtype=grad_out.dtype)
-        else:
-            grad_grad_bias = grad_grad_bias.contiguous()
+        # Original zero-materialization code retained below for reference.
+        # # Use zero cotangents for outputs that were not used by the caller.
+        # optional_grads = (
+        #     ("grad_grad_node", grad_grad_node, node_ebd),
+        #     ("grad_grad_node_ext", grad_grad_node_ext, node_ebd_ext),
+        #     ("grad_grad_edge_ebd", grad_grad_edge_ebd, flat_edge_ebd),
+        #     ("grad_grad_node_weight", grad_grad_node_weight, node_weight),
+        #     ("grad_grad_node_ext_weight", grad_grad_node_ext_weight, node_ext_weight),
+        #     ("grad_grad_edge_weight", grad_grad_edge_weight, edge_weight),
+        # )
+        # materialized = {
+        #     name: torch.zeros_like(reference) if value is None else value.contiguous()
+        #     for name, value, reference in optional_grads
+        # }
+        # if grad_grad_bias is None:
+        #     grad_grad_bias = torch.zeros((K,), device=grad_out.device, dtype=grad_out.dtype)
+        # else:
+        #     grad_grad_bias = grad_grad_bias.contiguous()
+        #
+        # grad_grad_node = materialized["grad_grad_node"]
+        # grad_grad_node_ext = materialized["grad_grad_node_ext"]
+        # grad_grad_edge_ebd = materialized["grad_grad_edge_ebd"]
+        # grad_grad_node_weight = materialized["grad_grad_node_weight"]
+        # grad_grad_node_ext_weight = materialized["grad_grad_node_ext_weight"]
+        # grad_grad_edge_weight = materialized["grad_grad_edge_weight"]
+        HAS_NODE = grad_grad_node is not None
+        grad_grad_node = None if grad_grad_node is None else grad_grad_node.contiguous()
+        HAS_EXT = grad_grad_node_ext is not None
+        grad_grad_node_ext = None if grad_grad_node_ext is None else grad_grad_node_ext.contiguous()
+        HAS_EDGE = grad_grad_edge_ebd is not None
+        grad_grad_edge_ebd = None if grad_grad_edge_ebd is None else grad_grad_edge_ebd.contiguous()
+        HAS_NODE_WEIGHT = grad_grad_node_weight is not None
+        grad_grad_node_weight = None if grad_grad_node_weight is None else grad_grad_node_weight.contiguous()
+        HAS_EXT_WEIGHT = grad_grad_node_ext_weight is not None
+        grad_grad_node_ext_weight = None if grad_grad_node_ext_weight is None else grad_grad_node_ext_weight.contiguous()
+        HAS_EDGE_WEIGHT = grad_grad_edge_weight is not None
+        grad_grad_edge_weight = None if grad_grad_edge_weight is None else grad_grad_edge_weight.contiguous()
+        HAS_BIAS = grad_grad_bias is not None
+        grad_grad_bias = None if grad_grad_bias is None else grad_grad_bias.contiguous()
 
-        grad_grad_node = materialized["grad_grad_node"]
-        grad_grad_node_ext = materialized["grad_grad_node_ext"]
-        grad_grad_edge_ebd = materialized["grad_grad_edge_ebd"]
-        grad_grad_node_weight = materialized["grad_grad_node_weight"]
-        grad_grad_node_ext_weight = materialized["grad_grad_node_ext_weight"]
-        grad_grad_edge_weight = materialized["grad_grad_edge_weight"]
-
+        # Saved tensors serve as unread, shape-compatible launch placeholders.
+        # The missing cotangents themselves remain None in Python.
         grad_grad_out = torch.empty_like(grad_out)
         grad_grad_node_ebd = torch.zeros_like(node_ebd)
         grad_grad_node_ebd_ext = torch.zeros_like(node_ebd_ext)
@@ -3418,6 +3454,13 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
             N_node=N_node,
             N_ext=N_ext,
             dtype=dtype,
+            HAS_NODE=HAS_NODE,
+            HAS_EXT=HAS_EXT,
+            HAS_EDGE=HAS_EDGE,
+            HAS_NODE_WEIGHT=HAS_NODE_WEIGHT,
+            HAS_EXT_WEIGHT=HAS_EXT_WEIGHT,
+            HAS_EDGE_WEIGHT=HAS_EDGE_WEIGHT,
+            HAS_BIAS=HAS_BIAS,
         )
         input_kernel(
             grad_out,
@@ -3429,13 +3472,13 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
             node_weight,
             node_ext_weight,
             edge_weight,
-            grad_grad_node,
-            grad_grad_node_ext,
-            grad_grad_edge_ebd,
-            grad_grad_node_weight,
-            grad_grad_node_ext_weight,
-            grad_grad_edge_weight,
-            grad_grad_bias,
+            grad_grad_node if HAS_NODE else node_ebd,
+            grad_grad_node_ext if HAS_EXT else node_ebd_ext,
+            grad_grad_edge_ebd if HAS_EDGE else flat_edge_ebd,
+            grad_grad_node_weight if HAS_NODE_WEIGHT else node_weight,
+            grad_grad_node_ext_weight if HAS_EXT_WEIGHT else node_ext_weight,
+            grad_grad_edge_weight if HAS_EDGE_WEIGHT else edge_weight,
+            grad_grad_bias if HAS_BIAS else node_weight[0],
             grad_grad_out,
             grad_grad_node_ebd,
             grad_grad_node_ebd_ext,
@@ -3476,10 +3519,13 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
             E=E, K=K, D_edge=D_edge, D_node=D_node, D_ext=D_ext,
             N_node=N_node, N_ext=N_ext, dtype=dtype,
             accum_dtype=dtype, SPLIT_M=split_m,
+            HAS_NODE=HAS_NODE, HAS_EXT=HAS_EXT, HAS_EDGE=HAS_EDGE,
         )
         weight_kernel_v2(
             grad_out, n2e_index, n_ext2e_index,
-            grad_grad_node, grad_grad_node_ext, grad_grad_edge_ebd, workspace,
+            grad_grad_node if HAS_NODE else node_ebd,
+            grad_grad_node_ext if HAS_EXT else node_ebd_ext,
+            grad_grad_edge_ebd if HAS_EDGE else flat_edge_ebd, workspace,
         )
         reduce_kernel_v2 = fused_edge_update_double_backward_weights_v2_reduce(
             K=K, D_edge=D_edge, D_node=D_node, D_ext=D_ext,
@@ -4243,6 +4289,7 @@ def fused_edge_update_double_backward_weights_v2(
     E, K, D_edge, D_node, D_ext, N_node, N_ext,
     dtype="float32", accum_dtype="float32",
     BLOCK_D=32, BLOCK_K=16, THREADS=128, BLOCK_M=32, SPLIT_M=4,
+    HAS_NODE=True, HAS_EXT=True, HAS_EDGE=True,
 ):
     """Gather a logical feature concatenation and compute split-E partials.
 
@@ -4270,31 +4317,41 @@ def fused_edge_update_double_backward_weights_v2(
             grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
             acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
             T.clear(acc)
-            for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
-                # Row-major shared layout; GEMM handles the transpose.
-                # Element guards also support feature tiles crossing segments.
-                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
-                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
-                    d = bx * BLOCK_D + di
-                    if m < E and d < D:
-                        if d < D_node:
-                            feature_shared[mi, di] = grad_grad_node[n2e_index[m], d]
-                        elif d < D_node + D_ext:
-                            feature_shared[mi, di] = grad_grad_node_ext[n_ext2e_index[m], d - D_node]
+            if (HAS_NODE and bx * BLOCK_D < D_node) or (HAS_EXT and bx * BLOCK_D < D_node + D_ext and (bx + 1) * BLOCK_D > D_node) or (HAS_EDGE and (bx + 1) * BLOCK_D > D_node + D_ext):
+                for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
+                    # Row-major shared layout; GEMM handles the transpose.
+                    # Element guards also support feature tiles crossing segments.
+                    for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                        m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                        d = bx * BLOCK_D + di
+                        if m < E and d < D:
+                            if d < D_node:
+                                if HAS_NODE:
+                                    feature_shared[mi, di] = grad_grad_node[n2e_index[m], d]
+                                else:
+                                    feature_shared[mi, di] = 0
+                            elif d < D_node + D_ext:
+                                if HAS_EXT:
+                                    feature_shared[mi, di] = grad_grad_node_ext[n_ext2e_index[m], d - D_node]
+                                else:
+                                    feature_shared[mi, di] = 0
+                            else:
+                                if HAS_EDGE:
+                                    feature_shared[mi, di] = grad_grad_edge_ebd[m, d - D_node - D_ext]
+                                else:
+                                    feature_shared[mi, di] = 0
                         else:
-                            feature_shared[mi, di] = grad_grad_edge_ebd[m, d - D_node - D_ext]
-                    else:
-                        feature_shared[mi, di] = 0
-                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
-                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
-                    k = by * BLOCK_K + ki
-                    if m < E and k < K:
-                        grad_shared[mi, ki] = grad_out[m, k]
-                    else:
-                        grad_shared[mi, ki] = 0
-                T.sync_threads()
-                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
-                T.sync_threads()
+                            feature_shared[mi, di] = 0
+                    for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                        k = by * BLOCK_K + ki
+                        if m < E and k < K:
+                            grad_shared[mi, ki] = grad_out[m, k]
+                        else:
+                            grad_shared[mi, ki] = 0
+                    T.sync_threads()
+                    T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                    T.sync_threads()
             for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
                 d = bx * BLOCK_D + di
                 k = by * BLOCK_K + ki
@@ -4349,6 +4406,7 @@ def fused_angle_update_double_backward_weights_v2(
     M, K, A, N, EK, N_NODE, N_EDGE,
     dtype="float32", accum_dtype="float32",
     BLOCK_D=32, BLOCK_K=16, THREADS=128, BLOCK_M=32, SPLIT_M=8,
+    HAS_ANGLE=True, HAS_NODE=True, HAS_EDGE=True,
 ):
     """Gather a logical feature concatenation and compute split-M partials.
 
@@ -4377,33 +4435,46 @@ def fused_angle_update_double_backward_weights_v2(
             grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
             acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
             T.clear(acc)
-            for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
-                # Row-major shared layout; GEMM handles the transpose.
-                # Element guards also support feature tiles crossing segments.
-                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
-                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
-                    d = bx * BLOCK_D + di
-                    if m < M and d < D:
-                        if d < A:
-                            feature_shared[mi, di] = gg_flat_angle[m, d]
-                        elif d < A + N:
-                            feature_shared[mi, di] = gg_flat_node[n2a_index[m], d - A]
-                        elif d < A + N + EK:
-                            feature_shared[mi, di] = gg_flat_edge[eik2a_index[m], d - A - N]
+            if (HAS_ANGLE and bx * BLOCK_D < A) or (HAS_NODE and bx * BLOCK_D < A + N and (bx + 1) * BLOCK_D > A) or (HAS_EDGE and (bx + 1) * BLOCK_D > A + N):
+                for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
+                    # Row-major shared layout; GEMM handles the transpose.
+                    # Element guards also support feature tiles crossing segments.
+                    for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                        m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                        d = bx * BLOCK_D + di
+                        if m < M and d < D:
+                            if d < A:
+                                if HAS_ANGLE:
+                                    feature_shared[mi, di] = gg_flat_angle[m, d]
+                                else:
+                                    feature_shared[mi, di] = 0
+                            elif d < A + N:
+                                if HAS_NODE:
+                                    feature_shared[mi, di] = gg_flat_node[n2a_index[m], d - A]
+                                else:
+                                    feature_shared[mi, di] = 0
+                            elif d < A + N + EK:
+                                if HAS_EDGE:
+                                    feature_shared[mi, di] = gg_flat_edge[eik2a_index[m], d - A - N]
+                                else:
+                                    feature_shared[mi, di] = 0
+                            else:
+                                if HAS_EDGE:
+                                    feature_shared[mi, di] = gg_flat_edge[eij2a_index[m], d - A - N - EK]
+                                else:
+                                    feature_shared[mi, di] = 0
                         else:
-                            feature_shared[mi, di] = gg_flat_edge[eij2a_index[m], d - A - N - EK]
-                    else:
-                        feature_shared[mi, di] = 0
-                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
-                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
-                    k = by * BLOCK_K + ki
-                    if m < M and k < K:
-                        grad_shared[mi, ki] = grad_output[m, k]
-                    else:
-                        grad_shared[mi, ki] = 0
-                T.sync_threads()
-                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
-                T.sync_threads()
+                            feature_shared[mi, di] = 0
+                    for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                        m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                        k = by * BLOCK_K + ki
+                        if m < M and k < K:
+                            grad_shared[mi, ki] = grad_output[m, k]
+                        else:
+                            grad_shared[mi, ki] = 0
+                    T.sync_threads()
+                    T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                    T.sync_threads()
             for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
                 d = bx * BLOCK_D + di
                 k = by * BLOCK_K + ki
@@ -5271,8 +5342,13 @@ def fused_angle_update_double_backward_inputs(
     BLOCK_M=32,
     BLOCK_N=32,
     BLOCK_K=32,
+    HAS_ANGLE=True, HAS_NODE=True, HAS_EDGE=True, HAS_ANGLE_WEIGHT=True, HAS_NODE_WEIGHT=True, HAS_IK_WEIGHT=True, HAS_IJ_WEIGHT=True, HAS_BIAS=True,
 ):
-    """Fuse grad-grad-output and angle/node/edge input-side VJPs."""
+    """Fuse grad-grad-output and angle/node/edge input-side VJPs.
+
+    HAS_* remove missing-cotangent pipelines at compile time. Direct outputs
+    remain fully written; scatter outputs retain their zero-initialization.
+    """
 
     @T.prim_func
     def double_backward_inputs(
@@ -5358,188 +5434,200 @@ def fused_angle_update_double_backward_inputs(
             T.clear(acc_output)
             if by * BLOCK_N < K:
                 # angle: U_x W and X U_w; each has its own pipeline.
-                for ro in T.Pipelined(T.ceildiv(A, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < M and r < A:
-                            lhs_shared[mi, ri] = gg_flat_angle[m, r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < A and n < K:
-                            rhs_shared[ri, ni] = sub_angle[r, n]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_output)
-                    T.sync_threads()
+                if HAS_ANGLE:
+                    for ro in T.Pipelined(T.ceildiv(A, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < M and r < A:
+                                lhs_shared[mi, ri] = gg_flat_angle[m, r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < A and n < K:
+                                rhs_shared[ri, ni] = sub_angle[r, n]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_output)
+                        T.sync_threads()
                 T.sync_threads()
-                for ro in T.Pipelined(T.ceildiv(A, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < M and r < A:
-                            lhs_shared[mi, ri] = flat_angle_ebd[m, r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < A and n < K:
-                            rhs_shared[ri, ni] = gg_sub_angle[r, n]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_output)
-                    T.sync_threads()
+                if HAS_ANGLE_WEIGHT:
+                    for ro in T.Pipelined(T.ceildiv(A, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < M and r < A:
+                                lhs_shared[mi, ri] = flat_angle_ebd[m, r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < A and n < K:
+                                rhs_shared[ri, ni] = gg_sub_angle[r, n]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_output)
+                        T.sync_threads()
                 T.sync_threads()
                 # node: U_x W and X U_w; each has its own pipeline.
-                for ro in T.Pipelined(T.ceildiv(N, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < M and r < N:
-                            lhs_shared[mi, ri] = gg_flat_node[n2a_index[m], r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < N and n < K:
-                            rhs_shared[ri, ni] = sub_node[r, n]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_output)
-                    T.sync_threads()
+                if HAS_NODE:
+                    for ro in T.Pipelined(T.ceildiv(N, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < M and r < N:
+                                lhs_shared[mi, ri] = gg_flat_node[n2a_index[m], r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < N and n < K:
+                                rhs_shared[ri, ni] = sub_node[r, n]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_output)
+                        T.sync_threads()
                 T.sync_threads()
-                for ro in T.Pipelined(T.ceildiv(N, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < M and r < N:
-                            lhs_shared[mi, ri] = flat_node_ebd[n2a_index[m], r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < N and n < K:
-                            rhs_shared[ri, ni] = gg_sub_node[r, n]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_output)
-                    T.sync_threads()
+                if HAS_NODE_WEIGHT:
+                    for ro in T.Pipelined(T.ceildiv(N, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < M and r < N:
+                                lhs_shared[mi, ri] = flat_node_ebd[n2a_index[m], r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < N and n < K:
+                                rhs_shared[ri, ni] = gg_sub_node[r, n]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_output)
+                        T.sync_threads()
                 T.sync_threads()
                 # ik: U_x W and X U_w; each has its own pipeline.
-                for ro in T.Pipelined(T.ceildiv(EK, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < M and r < EK:
-                            lhs_shared[mi, ri] = gg_flat_edge[eik2a_index[m], r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < EK and n < K:
-                            rhs_shared[ri, ni] = sub_edge_ik[r, n]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_output)
-                    T.sync_threads()
+                if HAS_EDGE:
+                    for ro in T.Pipelined(T.ceildiv(EK, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < M and r < EK:
+                                lhs_shared[mi, ri] = gg_flat_edge[eik2a_index[m], r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < EK and n < K:
+                                rhs_shared[ri, ni] = sub_edge_ik[r, n]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_output)
+                        T.sync_threads()
                 T.sync_threads()
-                for ro in T.Pipelined(T.ceildiv(EK, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < M and r < EK:
-                            lhs_shared[mi, ri] = flat_edge_ebd[eik2a_index[m], r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < EK and n < K:
-                            rhs_shared[ri, ni] = gg_sub_edge_ik[r, n]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_output)
-                    T.sync_threads()
+                if HAS_IK_WEIGHT:
+                    for ro in T.Pipelined(T.ceildiv(EK, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < M and r < EK:
+                                lhs_shared[mi, ri] = flat_edge_ebd[eik2a_index[m], r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < EK and n < K:
+                                rhs_shared[ri, ni] = gg_sub_edge_ik[r, n]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_output)
+                        T.sync_threads()
                 T.sync_threads()
                 # ij: U_x W and X U_w; each has its own pipeline.
-                for ro in T.Pipelined(T.ceildiv(EK, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < M and r < EK:
-                            lhs_shared[mi, ri] = gg_flat_edge[eij2a_index[m], r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < EK and n < K:
-                            rhs_shared[ri, ni] = sub_edge_ij[r, n]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_output)
-                    T.sync_threads()
+                if HAS_EDGE:
+                    for ro in T.Pipelined(T.ceildiv(EK, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < M and r < EK:
+                                lhs_shared[mi, ri] = gg_flat_edge[eij2a_index[m], r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < EK and n < K:
+                                rhs_shared[ri, ni] = sub_edge_ij[r, n]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_output)
+                        T.sync_threads()
                 T.sync_threads()
-                for ro in T.Pipelined(T.ceildiv(EK, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < M and r < EK:
-                            lhs_shared[mi, ri] = flat_edge_ebd[eij2a_index[m], r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < EK and n < K:
-                            rhs_shared[ri, ni] = gg_sub_edge_ij[r, n]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_output)
-                    T.sync_threads()
+                if HAS_IJ_WEIGHT:
+                    for ro in T.Pipelined(T.ceildiv(EK, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < M and r < EK:
+                                lhs_shared[mi, ri] = flat_edge_ebd[eij2a_index[m], r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < EK and n < K:
+                                rhs_shared[ri, ni] = gg_sub_edge_ij[r, n]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_output)
+                        T.sync_threads()
                 T.sync_threads()
             for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
                 m = bx * BLOCK_M + mi
                 n = by * BLOCK_N + ni
                 if m < M and n < K:
-                    grad_grad_output[m, n] = acc_output[mi, ni] + gg_bias[n]
+                    if HAS_BIAS:
+                        grad_grad_output[m, n] = acc_output[mi, ni] + gg_bias[n]
+                    else:
+                        grad_grad_output[m, n] = acc_output[mi, ni]
 
             # angle input VJP: G U_w.T; reuse the fragment after writeback.
             if by * BLOCK_N < A:
                 T.clear(acc_input)
-                for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < M and r < K:
-                            lhs_shared[mi, ri] = grad_output[m, r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < K and n < A:
-                            rhs_shared[ri, ni] = gg_sub_angle[n, r]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_input)
-                    T.sync_threads()
+                if HAS_ANGLE_WEIGHT:
+                    for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < M and r < K:
+                                lhs_shared[mi, ri] = grad_output[m, r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < K and n < A:
+                                rhs_shared[ri, ni] = gg_sub_angle[n, r]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_input)
+                        T.sync_threads()
                 T.sync_threads()
                 for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
                     m = bx * BLOCK_M + mi
@@ -5548,27 +5636,28 @@ def fused_angle_update_double_backward_inputs(
                         grad_flat_angle[m, n] = acc_input[mi, ni]
                 T.sync_threads()
 
-            # node input VJP: G U_w.T; reuse the fragment after writeback.
-            if by * BLOCK_N < N:
+            # node input VJP: missing cotangent leaves the zeroed output unchanged.
+            if HAS_NODE_WEIGHT and by * BLOCK_N < N:
                 T.clear(acc_input)
-                for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < M and r < K:
-                            lhs_shared[mi, ri] = grad_output[m, r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < K and n < N:
-                            rhs_shared[ri, ni] = gg_sub_node[n, r]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_input)
-                    T.sync_threads()
+                if HAS_NODE_WEIGHT:
+                    for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < M and r < K:
+                                lhs_shared[mi, ri] = grad_output[m, r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < K and n < N:
+                                rhs_shared[ri, ni] = gg_sub_node[n, r]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_input)
+                        T.sync_threads()
                 T.sync_threads()
                 for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
                     m = bx * BLOCK_M + mi
@@ -5577,27 +5666,28 @@ def fused_angle_update_double_backward_inputs(
                         T.atomic_add(grad_flat_node[n2a_index[m], n], acc_input[mi, ni])
                 T.sync_threads()
 
-            # ik input VJP: G U_w.T; reuse the fragment after writeback.
-            if by * BLOCK_N < EK:
+            # ik input VJP: missing cotangent leaves the zeroed output unchanged.
+            if HAS_IK_WEIGHT and by * BLOCK_N < EK:
                 T.clear(acc_input)
-                for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < M and r < K:
-                            lhs_shared[mi, ri] = grad_output[m, r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < K and n < EK:
-                            rhs_shared[ri, ni] = gg_sub_edge_ik[n, r]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_input)
-                    T.sync_threads()
+                if HAS_IK_WEIGHT:
+                    for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < M and r < K:
+                                lhs_shared[mi, ri] = grad_output[m, r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < K and n < EK:
+                                rhs_shared[ri, ni] = gg_sub_edge_ik[n, r]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_input)
+                        T.sync_threads()
                 T.sync_threads()
                 for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
                     m = bx * BLOCK_M + mi
@@ -5606,27 +5696,28 @@ def fused_angle_update_double_backward_inputs(
                         T.atomic_add(grad_flat_edge[eik2a_index[m], n], acc_input[mi, ni])
                 T.sync_threads()
 
-            # ij input VJP: G U_w.T; reuse the fragment after writeback.
-            if by * BLOCK_N < EK:
+            # ij input VJP: missing cotangent leaves the zeroed output unchanged.
+            if HAS_IJ_WEIGHT and by * BLOCK_N < EK:
                 T.clear(acc_input)
-                for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
-                    for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
-                        m = bx * BLOCK_M + mi
-                        r = ro * BLOCK_K + ri
-                        if m < M and r < K:
-                            lhs_shared[mi, ri] = grad_output[m, r]
-                        else:
-                            lhs_shared[mi, ri] = 0
-                    for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
-                        r = ro * BLOCK_K + ri
-                        n = by * BLOCK_N + ni
-                        if r < K and n < EK:
-                            rhs_shared[ri, ni] = gg_sub_edge_ij[n, r]
-                        else:
-                            rhs_shared[ri, ni] = 0
-                    T.sync_threads()
-                    T.gemm(lhs_shared, rhs_shared, acc_input)
-                    T.sync_threads()
+                if HAS_IJ_WEIGHT:
+                    for ro in T.Pipelined(T.ceildiv(K, BLOCK_K), num_stages=2):
+                        for mi, ri in T.Parallel(BLOCK_M, BLOCK_K):
+                            m = bx * BLOCK_M + mi
+                            r = ro * BLOCK_K + ri
+                            if m < M and r < K:
+                                lhs_shared[mi, ri] = grad_output[m, r]
+                            else:
+                                lhs_shared[mi, ri] = 0
+                        for ri, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                            r = ro * BLOCK_K + ri
+                            n = by * BLOCK_N + ni
+                            if r < K and n < EK:
+                                rhs_shared[ri, ni] = gg_sub_edge_ij[n, r]
+                            else:
+                                rhs_shared[ri, ni] = 0
+                        T.sync_threads()
+                        T.gemm(lhs_shared, rhs_shared, acc_input)
+                        T.sync_threads()
                 T.sync_threads()
                 for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
                     m = bx * BLOCK_M + mi
@@ -6012,6 +6103,8 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
             grad_sub_edge_ik, grad_sub_edge_ij,
         )
 
+        # Preserve undefined second-order cotangents instead of autograd zeros.
+        ctx.set_materialize_grads(False)
         ctx.save_for_backward(
             grad_output,
             flat_angle_ebd,
@@ -6134,47 +6227,66 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
         N_EDGE, EK = flat_edge_ebd.shape
         dtype = str(grad_output.dtype).replace("torch.", "")
 
-        grad_grad_flat_angle_ebd = (
-            torch.zeros_like(flat_angle_ebd)
-            if grad_grad_flat_angle_ebd is None
-            else grad_grad_flat_angle_ebd.contiguous()
-        )
-        grad_grad_flat_node_ebd = (
-            torch.zeros_like(flat_node_ebd)
-            if grad_grad_node_ebd is None
-            else grad_grad_node_ebd.reshape_as(flat_node_ebd).contiguous()
-        )
-        grad_grad_flat_edge_ebd = (
-            torch.zeros_like(flat_edge_ebd)
-            if grad_grad_flat_edge_ebd is None
-            else grad_grad_flat_edge_ebd.contiguous()
-        )
-        grad_grad_sub_angle = (
-            torch.zeros_like(sub_angle)
-            if grad_grad_sub_angle is None
-            else grad_grad_sub_angle.contiguous()
-        )
-        grad_grad_sub_node = (
-            torch.zeros_like(sub_node)
-            if grad_grad_sub_node is None
-            else grad_grad_sub_node.contiguous()
-        )
-        grad_grad_sub_edge_ik = (
-            torch.zeros_like(sub_edge_ik)
-            if grad_grad_sub_edge_ik is None
-            else grad_grad_sub_edge_ik.contiguous()
-        )
-        grad_grad_sub_edge_ij = (
-            torch.zeros_like(sub_edge_ij)
-            if grad_grad_sub_edge_ij is None
-            else grad_grad_sub_edge_ij.contiguous()
-        )
-        grad_grad_bias = (
-            torch.zeros((K,), device=grad_output.device, dtype=grad_output.dtype)
-            if grad_grad_bias is None
-            else grad_grad_bias.contiguous()
-        )
+        # Original zero-materialization code retained for reference.
+        # grad_grad_flat_angle_ebd = (
+        #     torch.zeros_like(flat_angle_ebd)
+        #     if grad_grad_flat_angle_ebd is None
+        #     else grad_grad_flat_angle_ebd.contiguous()
+        # )
+        # grad_grad_flat_node_ebd = (
+        #     torch.zeros_like(flat_node_ebd)
+        #     if grad_grad_node_ebd is None
+        #     else grad_grad_node_ebd.reshape_as(flat_node_ebd).contiguous()
+        # )
+        # grad_grad_flat_edge_ebd = (
+        #     torch.zeros_like(flat_edge_ebd)
+        #     if grad_grad_flat_edge_ebd is None
+        #     else grad_grad_flat_edge_ebd.contiguous()
+        # )
+        # grad_grad_sub_angle = (
+        #     torch.zeros_like(sub_angle)
+        #     if grad_grad_sub_angle is None
+        #     else grad_grad_sub_angle.contiguous()
+        # )
+        # grad_grad_sub_node = (
+        #     torch.zeros_like(sub_node)
+        #     if grad_grad_sub_node is None
+        #     else grad_grad_sub_node.contiguous()
+        # )
+        # grad_grad_sub_edge_ik = (
+        #     torch.zeros_like(sub_edge_ik)
+        #     if grad_grad_sub_edge_ik is None
+        #     else grad_grad_sub_edge_ik.contiguous()
+        # )
+        # grad_grad_sub_edge_ij = (
+        #     torch.zeros_like(sub_edge_ij)
+        #     if grad_grad_sub_edge_ij is None
+        #     else grad_grad_sub_edge_ij.contiguous()
+        # )
+        # grad_grad_bias = (
+        #     torch.zeros((K,), device=grad_output.device, dtype=grad_output.dtype)
+        #     if grad_grad_bias is None
+        #     else grad_grad_bias.contiguous()
+        # )
+        HAS_ANGLE = grad_grad_flat_angle_ebd is not None
+        grad_grad_flat_angle_ebd = None if grad_grad_flat_angle_ebd is None else grad_grad_flat_angle_ebd.contiguous()
+        HAS_NODE = grad_grad_node_ebd is not None
+        grad_grad_flat_node_ebd = None if grad_grad_node_ebd is None else grad_grad_node_ebd.reshape_as(flat_node_ebd).contiguous()
+        HAS_EDGE = grad_grad_flat_edge_ebd is not None
+        grad_grad_flat_edge_ebd = None if grad_grad_flat_edge_ebd is None else grad_grad_flat_edge_ebd.contiguous()
+        HAS_ANGLE_WEIGHT = grad_grad_sub_angle is not None
+        grad_grad_sub_angle = None if grad_grad_sub_angle is None else grad_grad_sub_angle.contiguous()
+        HAS_NODE_WEIGHT = grad_grad_sub_node is not None
+        grad_grad_sub_node = None if grad_grad_sub_node is None else grad_grad_sub_node.contiguous()
+        HAS_IK_WEIGHT = grad_grad_sub_edge_ik is not None
+        grad_grad_sub_edge_ik = None if grad_grad_sub_edge_ik is None else grad_grad_sub_edge_ik.contiguous()
+        HAS_IJ_WEIGHT = grad_grad_sub_edge_ij is not None
+        grad_grad_sub_edge_ij = None if grad_grad_sub_edge_ij is None else grad_grad_sub_edge_ij.contiguous()
+        HAS_BIAS = grad_grad_bias is not None
+        grad_grad_bias = None if grad_grad_bias is None else grad_grad_bias.contiguous()
 
+        # Saved tensors serve as unread, shape-compatible launch placeholders.
+        # The missing cotangents themselves remain None in Python.
         grad_grad_output = torch.empty_like(grad_output)
         grad_flat_angle_ebd = torch.empty_like(flat_angle_ebd)
         grad_flat_node_ebd = torch.zeros_like(flat_node_ebd)
@@ -6188,6 +6300,15 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
             N_NODE=N_NODE,
             N_EDGE=N_EDGE,
             dtype=dtype,
+            accum_dtype=dtype,
+            HAS_ANGLE=HAS_ANGLE,
+            HAS_NODE=HAS_NODE,
+            HAS_EDGE=HAS_EDGE,
+            HAS_ANGLE_WEIGHT=HAS_ANGLE_WEIGHT,
+            HAS_NODE_WEIGHT=HAS_NODE_WEIGHT,
+            HAS_IK_WEIGHT=HAS_IK_WEIGHT,
+            HAS_IJ_WEIGHT=HAS_IJ_WEIGHT,
+            HAS_BIAS=HAS_BIAS,
         )
         input_kernel(
             grad_output,
@@ -6201,14 +6322,14 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
             sub_node,
             sub_edge_ik,
             sub_edge_ij,
-            grad_grad_flat_angle_ebd,
-            grad_grad_flat_node_ebd,
-            grad_grad_flat_edge_ebd,
-            grad_grad_sub_angle,
-            grad_grad_sub_node,
-            grad_grad_sub_edge_ik,
-            grad_grad_sub_edge_ij,
-            grad_grad_bias,
+            grad_grad_flat_angle_ebd if HAS_ANGLE else flat_angle_ebd,
+            grad_grad_flat_node_ebd if HAS_NODE else flat_node_ebd,
+            grad_grad_flat_edge_ebd if HAS_EDGE else flat_edge_ebd,
+            grad_grad_sub_angle if HAS_ANGLE_WEIGHT else sub_angle,
+            grad_grad_sub_node if HAS_NODE_WEIGHT else sub_node,
+            grad_grad_sub_edge_ik if HAS_IK_WEIGHT else sub_edge_ik,
+            grad_grad_sub_edge_ij if HAS_IJ_WEIGHT else sub_edge_ij,
+            grad_grad_bias if HAS_BIAS else sub_angle[0],
             grad_grad_output,
             grad_flat_angle_ebd,
             grad_flat_node_ebd,
@@ -6250,10 +6371,14 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
         weight_kernel_v2 = fused_angle_update_double_backward_weights_v2(
             M=M, K=K, A=A, N=N, EK=EK, N_NODE=N_NODE, N_EDGE=N_EDGE,
             dtype=dtype, accum_dtype=dtype, SPLIT_M=split_m,
+            HAS_ANGLE=HAS_ANGLE, HAS_NODE=HAS_NODE, HAS_EDGE=HAS_EDGE,
         )
         weight_kernel_v2(
-            grad_output, grad_grad_flat_angle_ebd, grad_grad_flat_node_ebd,
-            grad_grad_flat_edge_ebd, n2a_index, eij2a_index, eik2a_index, workspace,
+            grad_output,
+            grad_grad_flat_angle_ebd if HAS_ANGLE else flat_angle_ebd,
+            grad_grad_flat_node_ebd if HAS_NODE else flat_node_ebd,
+            grad_grad_flat_edge_ebd if HAS_EDGE else flat_edge_ebd,
+            n2a_index, eij2a_index, eik2a_index, workspace,
         )
         reduce_kernel_v2 = fused_angle_update_double_backward_weights_v2_reduce(
             K=K, A=A, N=N, EK=EK, SPLIT_M=split_m, accum_dtype=dtype,
