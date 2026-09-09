@@ -82,6 +82,72 @@ class Tests(unittest.TestCase):
         imports = [n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]
         self.assertNotIn("repflow_full_timing", imports)
 
+    def test_zeroing_resources_and_no_double_counting(self):
+        events = [dict(cat="user_annotation", name="rfbench|backward|angle|layer0", pid=1, tid=2, ts=0, dur=100),
+                  dict(cat="user_annotation", name="rfbench_kernel|fused_angle_update_backward_weights_v2", pid=1, tid=2, ts=1, dur=90),
+                  dict(cat="cpu_op", name="aten::zeros", pid=1, tid=2, ts=2, dur=10),
+                  dict(cat="cuda_runtime", name="cudaLaunchKernel", pid=1, tid=2, ts=4, dur=1, args={"correlation": 1}),
+                  dict(cat="cuda_runtime", name="cudaLaunchKernel", pid=1, tid=2, ts=20, dur=1, args={"correlation": 2}),
+                  dict(cat="kernel", name="FillFunctor", pid=0, tid=7, ts=200, dur=3, args={"correlation": 1}),
+                  dict(cat="kernel", name="partials", pid=0, tid=7, ts=204, dur=7,
+                       args={"correlation": 2, "registers per thread": 32, "shared memory": 0,
+                             "grid": [8, 1, 1], "block": [128, 1, 1]})]
+        result = analyze({"traceEvents": events})
+        self.assertEqual({r["component"] for r in result["attribution"]}, {"zeroing", "weights_partial"})
+        self.assertAlmostEqual(sum(r["gpu_ms"] for r in result["attribution"]), .01)
+        self.assertAlmostEqual(sum(r["kernel_ms"] for r in result["kernels"]), .01)
+        zero, partial = result["kernel_resources"]
+        self.assertIsNone(zero["shared_bytes_per_block"])
+        self.assertEqual(partial["shared_bytes_per_block"], 0)
+        self.assertEqual(partial["registers_per_thread"], 32)
+        self.assertEqual(partial["kernel_launches"], 1)
+
+    def test_unknown_fill_and_memset_are_not_assumed_zero(self):
+        from repflow_trace_v2 import component
+        self.assertEqual(component("torch_or_runtime", dict(cat="kernel", name="FillFunctor"), []),
+                         "fill_value_unknown")
+        self.assertEqual(component("torch_or_runtime", dict(cat="gpu_memset", name="Memset"), []),
+                         "memset_value_unknown")
+
+    def test_metadata_hit_and_miss_cpu_diagnostics(self):
+        from repflow_resource_report_v2 import tables
+        result = analyze({"traceEvents": [
+            dict(cat="user_annotation", name="rfbench|forward|sym|layer0", pid=1, tid=2, ts=0, dur=100),
+            dict(cat="user_annotation", name="rfbench_metadata|hit", pid=1, tid=2, ts=1, dur=20),
+            dict(cat="user_annotation", name="rfbench_kernel|owner_metadata", pid=1, tid=2, ts=2, dur=10)]})
+        with tempfile.TemporaryDirectory() as tmp:
+            _, data = tables(Path(tmp), [dict(version="current", frame=0, profiles=[result])])
+        meta = data["owner_metadata"][0]
+        self.assertEqual(meta["hit_calls"], 1)
+        self.assertEqual(meta["miss_calls"], 0)
+        self.assertEqual(meta["hit_cpu_ms"], .01)
+
+    def test_memory_sample_reset_and_baseline(self):
+        rows, actions = [], []
+        fake = SimpleNamespace(synchronize=lambda: actions.append("sync"),
+                               memory_allocated=lambda: 100, memory_reserved=lambda: 200,
+                               reset_peak_memory_stats=lambda: actions.append("reset"),
+                               max_memory_allocated=lambda: 180, max_memory_reserved=lambda: 256)
+        with patch.object(torch, "cuda", fake):
+            result = bench.measure_memory(lambda: actions.append("compute") or 9, rows, "loss_backward")
+        self.assertEqual(result, 9)
+        self.assertEqual(actions, ["sync", "reset", "compute", "sync"])
+        self.assertEqual(rows[0]["increment_allocated_bytes"], 80)
+        self.assertEqual(rows[0]["baseline_reserved_bytes"], 200)
+
+    def test_resource_table_skipped_memory_and_missing_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bench.write_report(Path(tmp), [dict(version="current", frame=0, samples=[], profiles=[], memory=[
+                dict(stage="full_step", baseline_allocated_bytes=1048576, peak_allocated_bytes=2097152,
+                     increment_allocated_bytes=1048576, baseline_reserved_bytes=3145728,
+                     peak_reserved_bytes=3145728)])])
+            text = (Path(tmp) / "REPORT.md").read_text(encoding="utf-8")
+            self.assertIn("优化归因表", text)
+            self.assertIn("正确性与资源表", text)
+            data = json.loads((Path(tmp) / "attribution_resources.json").read_text())
+            self.assertIsNone(data["correctness"][0]["max_abs"])
+            self.assertEqual(data["memory"][0]["peak_allocated_bytes"], 2097152)
+
 
 if __name__ == "__main__":
     unittest.main()

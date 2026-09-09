@@ -14,7 +14,7 @@ from collections import defaultdict
 
 
 @contextlib.contextmanager
-def force_calls(rec, measured, rows):
+def force_calls(rec, measured, rows, memory_rows=None):
     import torch
     original = torch.autograd.grad
     def grad(*args, **kwargs):
@@ -31,6 +31,8 @@ def force_calls(rec, measured, rows):
         old = rec.phase
         rec.phase = "force"
         try:
+            if memory_rows is not None:
+                return measure_memory(lambda: original(*args, **kwargs), memory_rows, "force_autograd")
             if measured:
                 return timed(lambda: original(*args, **kwargs), rows, "force_autograd")
             return original(*args, **kwargs)
@@ -57,6 +59,54 @@ def timed(fn, rows, stage):
     wall = (time.perf_counter() - t0) * 1000
     rows.append(dict(stage=stage, wall_ms=wall, cuda_ms=start.elapsed_time(end)))
     return result
+
+
+def measure_memory(fn, rows, stage):
+    """One independent allocator-peak sample, never nested in a timed pass."""
+    import torch
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+    reserved = torch.cuda.memory_reserved()
+    torch.cuda.reset_peak_memory_stats()
+    result = fn()
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated()
+    rows.append(dict(stage=stage, baseline_allocated_bytes=baseline,
+                     peak_allocated_bytes=peak, increment_allocated_bytes=peak - baseline,
+                     baseline_reserved_bytes=reserved,
+                     peak_reserved_bytes=torch.cuda.max_memory_reserved()))
+    return result
+
+
+@contextlib.contextmanager
+def metadata_diagnostics(version, rec):
+    """Cache hit/miss annotations only in the separate profiler pass."""
+    if version == "original":
+        yield
+        return
+    import torch
+    if version == "legacy_rebuilt":
+        import repflow_bench_legacy as selected
+    else:
+        from deepmd.pt.model.descriptor import utils_tilelang as selected
+    original = selected._sym_owner_metadata
+    def metadata(owner, num_owner):
+        if not rec.enabled:
+            return original(owner, num_owner)
+        base = owner
+        while base._base is not None:
+            base = base._base
+        key = (id(base), owner.data_ptr(), owner.numel(), owner.stride(),
+               owner._version, num_owner, owner.device)
+        cached = selected._sym_owner_cache.get(key)
+        hit = cached is not None and cached[0]() is base
+        with torch.profiler.record_function("rfbench_metadata|" + ("hit" if hit else "miss")):
+            return original(owner, num_owner)
+    selected._sym_owner_metadata = metadata
+    try:
+        yield
+    finally:
+        selected._sym_owner_metadata = original
 
 
 def write_report(directory, runs):
@@ -118,8 +168,12 @@ def write_report(directory, runs):
                   "CPU 标记时长、GPU 首末时间戳及 factory 分解保存在 results.json。",
                   "CPU 标记时长不是 GPU 完成时间；首末 GPU 跨度可能夹杂其他算子，不是独立算子延迟。",
                   "profiler 中的 hooks/标记有开销，但不会用于表 1 的计时。"])
+    from repflow_resource_report_v2 import tables
+    resource_lines, resource_data = tables(directory, runs)
+    lines.extend([""] + resource_lines)
     (directory / "REPORT.md").write_text("\n".join(lines), encoding="utf-8")
-    (directory / "results.json").write_text(json.dumps(dict(summary=summary, runs=runs), indent=2), encoding="utf-8")
+    (directory / "results.json").write_text(json.dumps(dict(summary=summary, runs=runs,
+                                                           resources=resource_data), indent=2), encoding="utf-8")
 
 
 def benchmark(trainer, args, directory):
@@ -153,7 +207,7 @@ def benchmark(trainer, args, directory):
         wrapper.load_state_dict(state)
         with select_version(version, rec):
             for frame, batch in enumerate(batches):
-                run = dict(version=version, frame=frame, correctness="SKIPPED", samples=[], profiles=[])
+                run = dict(version=version, frame=frame, correctness="SKIPPED", samples=[], profiles=[], memory=[])
                 runs.append(run)
                 def execute(mode):
                     rec.clear_graph_hooks()
@@ -174,13 +228,21 @@ def benchmark(trainer, args, directory):
                         rec.phase = "loss"
                         loss.backward()
                     try:
-                        with force_calls(rec, mode == "force_autograd", rows):
-                            if mode == "full_step":
+                        with force_calls(rec, mode == "force_autograd", rows,
+                                         run["memory"] if mode == "memory_force_autograd" else None):
+                            if mode == "memory_full_step":
+                                measure_memory(step, run["memory"], "full_step")
+                            elif mode == "full_step":
                                 timed(step, rows, mode)
                             else:
-                                _, loss, _ = (timed(forward, rows, mode) if mode == "train_forward_including_force" else forward())
+                                if mode == "memory_train_forward_including_force":
+                                    _, loss, _ = measure_memory(forward, run["memory"], "train_forward_including_force")
+                                else:
+                                    _, loss, _ = (timed(forward, rows, mode) if mode == "train_forward_including_force" else forward())
                                 rec.phase = "loss"
-                                if mode == "loss_backward":
+                                if mode == "memory_loss_backward":
+                                    measure_memory(loss.backward, run["memory"], "loss_backward")
+                                elif mode == "loss_backward":
                                     timed(loss.backward, rows, mode)
                                 else:
                                     loss.backward()
@@ -202,11 +264,15 @@ def benchmark(trainer, args, directory):
                             rows.extend(execute(mode))
                         run["samples"].append(rows)
                         print(f"  true-graph sample {sample + 1}/{args.repeat}", flush=True)
+                    print("  independent allocator-peak samples", flush=True)
+                    for stage in ("full_step", "train_forward_including_force", "force_autograd", "loss_backward"):
+                        execute("memory_" + stage)
                     for sample in range(args.profile_repeat):
                         rec.enabled = True
                         # capture stays False: no index copies or GPU->CPU reads.
-                        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                                              torch.profiler.ProfilerActivity.CUDA]) as prof:
+                        with metadata_diagnostics(version, rec), torch.profiler.profile(
+                                activities=[torch.profiler.ProfilerActivity.CPU,
+                                            torch.profiler.ProfilerActivity.CUDA]) as prof:
                             execute("profile")
                         rec.enabled = False
                         path = directory / f"trace_v2_{version}_{frame}_{sample}.json"
