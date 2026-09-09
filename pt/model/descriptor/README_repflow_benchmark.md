@@ -148,7 +148,10 @@ loss_backward 包含能量的一阶路径和力/virial 的二阶路径，不能�
 
 ## 数值精度
 
-默认 atol=2e-4、rtol=2e-3，不为了展示加速而自动放宽。
+按用户要求，默认绝对容差调整为 atol=1e-3，相对容差保持 rtol=2e-3。
+实际判据为 abs(actual-reference) <= atol + rtol * abs(reference)。
+可用 --atol/--rtol 覆盖；运行采用的容差记录在 metadata.json 中。
+放宽容差不改变计算结果，也不证明误差来源或训练精度可接受。
 TF32-RZ 是此前已知风险，当前 full-model 回归仍可能失败。
 --disable-tf32 只控制 PyTorch/cuBLAS 设置，不会把 TileLang T.gemm 自动变成全精度 FP32。
 需要同时查看 max_abs、relative_l2 和 per_tensor，区分数值问题与索引/求导错误。

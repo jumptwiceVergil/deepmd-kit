@@ -23,6 +23,15 @@ class HarnessTests(unittest.TestCase):
         self.assertTrue(compare({"g": None}, {"g": torch.zeros(3)}, 1e-8, 1e-8)["pass"])
         self.assertFalse(compare({"g": torch.ones(3)}, {"g": torch.zeros(3)}, 1e-8, 1e-8)["pass"])
 
+    def test_requested_absolute_tolerance(self):
+        reference = {"g": torch.zeros(1)}
+        actual = {"g": torch.tensor([5e-4])}
+        self.assertFalse(compare(reference, actual, 2e-4, 2e-3)["pass"])
+        result = compare(reference, actual, 1e-3, 2e-3)
+        self.assertTrue(result["pass"])
+        self.assertGreater(result["max_abs"], 0)
+        self.assertFalse(compare(reference, {"g": torch.tensor([2e-3])}, 1e-3, 2e-3)["pass"])
+
     def test_file_isolation(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

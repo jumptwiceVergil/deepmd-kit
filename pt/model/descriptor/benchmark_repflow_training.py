@@ -36,7 +36,7 @@ def arguments():
     p.add_argument("--profile-repeat", type=int, default=2)
     p.add_argument("--step", type=int, default=0, help="Loss/LR schedule step; no optimizer update")
     p.add_argument("--seed", type=int, default=10)
-    p.add_argument("--atol", type=float, default=2e-4)
+    p.add_argument("--atol", type=float, default=1e-3)
     p.add_argument("--rtol", type=float, default=2e-3)
     p.add_argument("--skip-neighbor-stat", action="store_true")
     p.add_argument("--disable-tf32", action="store_true",
@@ -174,6 +174,7 @@ def benchmark(trainer, args, directory):
         "cuda": torch.version.cuda, "gpu": torch.cuda.get_device_name(),
         "device_properties": str(torch.cuda.get_device_properties(torch.cuda.current_device())),
         "tf32_matmul": torch.backends.cuda.matmul.allow_tf32,
+        "correctness_tolerances": {"atol": args.atol, "rtol": args.rtol},
         "loss_schedule_step": args.step, "loss_pref_lr": pref_lr,
         "actual_repflow_layers": list(rec.layer_names.values()),
         "actual_model": repr(wrapper),
