@@ -1338,9 +1338,9 @@ def fused_edge_update_forward(
     NODE_DIM: int,
     EDGE_DIM: int,
     OUT_DIM: int,
-    BLK_M: int = 128,
-    BLK_N: int = 64,
-    BLK_K: int = 64,
+    BLK_M: int = 32,
+    BLK_N: int = 32,
+    BLK_K: int = 32,
 ):
     @T.prim_func
     def kernel(
@@ -2144,7 +2144,7 @@ def fused_edge_update_weight_backward_v2(
     TILES_PER_SPLIT = ((E + BLOCK_M - 1) // BLOCK_M + SPLIT_M - 1) // SPLIT_M
 
     @T.prim_func
-    def weight_partials(
+    def edge_backward_weight_partials(
         grad_out: T.Tensor((E, K), dtype),
         n2e_index: T.Tensor((E,), "int64"),
         n_ext2e_index: T.Tensor((E,), "int64"),
@@ -2188,7 +2188,7 @@ def fused_edge_update_weight_backward_v2(
                 k = by * BLOCK_K + ki
                 if d < D and k < K:
                     workspace[bs, d, k] = acc[di, ki]
-    return weight_partials
+    return edge_backward_weight_partials
 
 
 @tilelang.jit
@@ -3242,9 +3242,9 @@ def fused_angle_update_forward(
     NODE_DIM: int,
     EDGE_DIM: int,
     OUT_DIM: int,
-    BLK_M: int = 128,
-    BLK_N: int = 64,
-    BLK_K: int = 64,
+    BLK_M: int = 32,
+    BLK_N: int = 32,
+    BLK_K: int = 32,
 ):
     @T.prim_func
     def fused_angle_update(
@@ -3875,7 +3875,7 @@ def fused_angle_update_backward_weights_v2(
     TILES_PER_SPLIT = ((M + BLOCK_M - 1) // BLOCK_M + SPLIT_M - 1) // SPLIT_M
 
     @T.prim_func
-    def weight_partials(
+    def angle_backward_weight_partials(
         grad_output: T.Tensor((M, K), dtype),
         flat_angle_ebd: T.Tensor((M, A), dtype),
         flat_node_ebd: T.Tensor((N_NODE, N), dtype),
@@ -3922,7 +3922,7 @@ def fused_angle_update_backward_weights_v2(
                 k = by * BLOCK_K + ki
                 if d < D and k < K:
                     workspace[bs, d, k] = acc[di, ki]
-    return weight_partials
+    return angle_backward_weight_partials
 
 
 @tilelang.jit
@@ -3988,7 +3988,7 @@ def fused_edge_update_double_backward_weights_v2(
     TILES_PER_SPLIT = ((E + BLOCK_M - 1) // BLOCK_M + SPLIT_M - 1) // SPLIT_M
 
     @T.prim_func
-    def weight_partials(
+    def edge_double_backward_weight_partials(
         grad_out: T.Tensor((E, K), dtype),
         n2e_index: T.Tensor((E,), "int64"),
         n_ext2e_index: T.Tensor((E,), "int64"),
@@ -4042,7 +4042,7 @@ def fused_edge_update_double_backward_weights_v2(
                 k = by * BLOCK_K + ki
                 if d < D and k < K:
                     workspace[bs, d, k] = acc[di, ki]
-    return weight_partials
+    return edge_double_backward_weight_partials
 
 @tilelang.jit
 def fused_edge_update_double_backward_weights_v2_reduce(
@@ -4104,7 +4104,7 @@ def fused_angle_update_double_backward_weights_v2(
     TILES_PER_SPLIT = ((M + BLOCK_M - 1) // BLOCK_M + SPLIT_M - 1) // SPLIT_M
 
     @T.prim_func
-    def weight_partials(
+    def angle_double_backward_weight_partials(
         grad_output: T.Tensor((M, K), dtype),
         gg_flat_angle: T.Tensor((M, A), dtype),
         gg_flat_node: T.Tensor((N_NODE, N), dtype),
@@ -4164,7 +4164,7 @@ def fused_angle_update_double_backward_weights_v2(
                 k = by * BLOCK_K + ki
                 if d < D and k < K:
                     workspace[bs, d, k] = acc[di, ki]
-    return weight_partials
+    return angle_double_backward_weight_partials
 
 
 @tilelang.jit
@@ -5247,7 +5247,7 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
         # )
         # Bound the split count by available reduction tiles. Workspace is
         # temporary and is not saved for double backward.
-        split_m = min(8, max(1, (M + 31) // 32))
+        split_m = min(32, max(1, (M + 31) // 32))
         workspace = torch.empty(
             (split_m, A + N + 2 * EK, K),
             device=grad_output.device, dtype=grad_output.dtype,
@@ -5528,7 +5528,7 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
         #     grad_sub_edge_ik,
         #     grad_sub_edge_ij,
         # )
-        split_m = min(8, max(1, (M + 31) // 32))
+        split_m = min(32, max(1, (M + 31) // 32))
         workspace = torch.empty(
             (split_m, A + N + 2 * EK, K),
             dtype=grad_output.dtype, device=grad_output.device,
