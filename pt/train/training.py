@@ -794,8 +794,10 @@ class Trainer:
                     model_pred, loss, more_loss = self.wrapper(
                         **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
                     )
-                with torch.cuda.nvtx.range("backward"):
-                    loss.backward()
+                # with torch.cuda.nvtx.range("backward"):
+                torch.cuda.nvtx.range_push("backward")
+                loss.backward()
+                torch.cuda.nvtx.range_pop()
                 with torch.cuda.nvtx.range("get_clip"):
                     if self.gradient_max_norm > 0.0:
                         torch.nn.utils.clip_grad_norm_(

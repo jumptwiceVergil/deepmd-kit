@@ -2204,7 +2204,7 @@ def fused_edge_update_weight_backward_v2_reduce(
     D = D_node + D_ext + D_edge
 
     @T.prim_func
-    def reduce_partials(
+    def edge_backward_reduce_partials(
         workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
         grad_node_weight: T.Tensor((D_node, K), accum_dtype),
         grad_node_ext_weight: T.Tensor((D_ext, K), accum_dtype),
@@ -2229,7 +2229,7 @@ def fused_edge_update_weight_backward_v2_reduce(
                         grad_node_ext_weight[d - D_node, k] = acc[di, ki]
                     else:
                         grad_edge_weight[d - D_node - D_ext, k] = acc[di, ki]
-    return reduce_partials
+    return edge_backward_reduce_partials
 
 
 @tilelang.jit
@@ -3938,7 +3938,7 @@ def fused_angle_update_backward_weights_v2_reduce(
     D = A + N + 2 * EK
 
     @T.prim_func
-    def reduce_partials(
+    def angle_backward_reduce_partials(
         workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
         grad_sub_angle: T.Tensor((A, K), accum_dtype),
         grad_sub_node: T.Tensor((N, K), accum_dtype),
@@ -3966,7 +3966,7 @@ def fused_angle_update_backward_weights_v2_reduce(
                         grad_sub_edge_ik[d - A - N, k] = acc[di, ki]
                     else:
                         grad_sub_edge_ij[d - A - N - EK, k] = acc[di, ki]
-    return reduce_partials
+    return angle_backward_reduce_partials
 
 
 @tilelang.jit
@@ -4057,7 +4057,7 @@ def fused_edge_update_double_backward_weights_v2_reduce(
     D = D_node + D_ext + D_edge
 
     @T.prim_func
-    def reduce_partials(
+    def edge_double_backward_reduce_partials(
         workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
         grad_node_weight: T.Tensor((D_node, K), accum_dtype),
         grad_node_ext_weight: T.Tensor((D_ext, K), accum_dtype),
@@ -4082,7 +4082,7 @@ def fused_edge_update_double_backward_weights_v2_reduce(
                         grad_node_ext_weight[d - D_node, k] = acc[di, ki]
                     else:
                         grad_edge_weight[d - D_node - D_ext, k] = acc[di, ki]
-    return reduce_partials
+    return edge_double_backward_reduce_partials
 
 
 @tilelang.jit
@@ -4180,7 +4180,7 @@ def fused_angle_update_double_backward_weights_v2_reduce(
     D = A + N + 2 * EK
 
     @T.prim_func
-    def reduce_partials(
+    def angle_double_backward_reduce_partials(
         workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
         grad_sub_angle: T.Tensor((A, K), accum_dtype),
         grad_sub_node: T.Tensor((N, K), accum_dtype),
@@ -4208,7 +4208,7 @@ def fused_angle_update_double_backward_weights_v2_reduce(
                         grad_sub_edge_ik[d - A - N, k] = acc[di, ki]
                     else:
                         grad_sub_edge_ij[d - A - N - EK, k] = acc[di, ki]
-    return reduce_partials
+    return angle_double_backward_reduce_partials
 
 @tilelang.jit
 def fused_angle_node_backward_v3_1(
@@ -5247,7 +5247,7 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
         # )
         # Bound the split count by available reduction tiles. Workspace is
         # temporary and is not saved for double backward.
-        split_m = min(32, max(1, (M + 31) // 32))
+        split_m = min(64, max(1, (M + 31) // 32))
         workspace = torch.empty(
             (split_m, A + N + 2 * EK, K),
             device=grad_output.device, dtype=grad_output.dtype,
