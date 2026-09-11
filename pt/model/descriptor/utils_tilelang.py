@@ -5247,7 +5247,7 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
         # )
         # Bound the split count by available reduction tiles. Workspace is
         # temporary and is not saved for double backward.
-        split_m = min(64, max(1, (M + 31) // 32))
+        split_m = min(80, max(1, (M + 31) // 32))
         workspace = torch.empty(
             (split_m, A + N + 2 * EK, K),
             device=grad_output.device, dtype=grad_output.dtype,
