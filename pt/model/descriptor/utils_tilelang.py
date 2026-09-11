@@ -3960,7 +3960,10 @@ def fused_angle_update_backward_weights_v3_1(
             T.clear(acc)
             for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
                 # Store the gathered feature tile physically as [D, M].
-                for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
+                # Preserve the v2 producer traversal order.  Only the shared-memory
+                # destination is transposed; swapping the Parallel axes makes
+                # TileLang's vectorization planner see vector-valued gather indices.
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
                     m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
                     d = bx * BLOCK_D + di
                     if m < M and d < D:
@@ -4033,7 +4036,10 @@ def fused_angle_update_backward_weights_v3_2(
             T.clear(acc)
             for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
                 # Store the gathered feature tile physically as [D, M].
-                for di, mi in T.Parallel(BLOCK_D, BLOCK_M):
+                # Preserve the v2 producer traversal order.  Only the shared-memory
+                # destination is transposed; swapping the Parallel axes makes
+                # TileLang's vectorization planner see vector-valued gather indices.
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
                     m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
                     d = bx * BLOCK_D + di
                     if m < M and d < D:
