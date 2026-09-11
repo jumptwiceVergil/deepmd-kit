@@ -1392,7 +1392,7 @@ class RepFlowLayer(torch.nn.Module):
                 self.axis_neuron,
             )
             if not self.use_dynamic_sel
-            else self.fused_symmetrization_op_dynamic(
+            else self.symmetrization_op_dynamic(
                 edge_ebd,
                 h2,
                 sw,
@@ -1413,7 +1413,7 @@ class RepFlowLayer(torch.nn.Module):
                 self.axis_neuron,
             )
             if not self.use_dynamic_sel
-            else self.fused_symmetrization_op_dynamic(
+            else self.symmetrization_op_dynamic(
                 nei_node_ebd,
                 h2,
                 sw,
@@ -1473,7 +1473,7 @@ class RepFlowLayer(torch.nn.Module):
                     "node",
                 )
                 if not self.use_dynamic_sel
-                else self.fused_optim_edge_update_dynamic(
+                else self.optim_edge_update_dynamic(
                     node_ebd,
                     node_ebd_ext,
                     edge_ebd,
@@ -1525,7 +1525,7 @@ class RepFlowLayer(torch.nn.Module):
                     "edge",
                 )
                 if not self.use_dynamic_sel
-                else self.fused_optim_edge_update_dynamic(
+                else self.optim_edge_update_dynamic(
                     node_ebd,
                     node_ebd_ext,
                     edge_ebd,

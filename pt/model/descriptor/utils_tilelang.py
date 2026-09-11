@@ -1338,9 +1338,9 @@ def fused_edge_update_forward(
     NODE_DIM: int,
     EDGE_DIM: int,
     OUT_DIM: int,
-    BLK_M: int = 32,
-    BLK_N: int = 32,
-    BLK_K: int = 32,
+    BLK_M: int = 64,
+    BLK_N: int = 64,
+    BLK_K: int = 64,
 ):
     @T.prim_func
     def kernel(
