@@ -4137,6 +4137,120 @@ def fused_angle_update_backward_weights_v3_2(
 
 
 @tilelang.jit
+def fused_angle_update_backward_weights_v3_3(
+    M, K, A, N, EK, N_NODE, N_EDGE,
+    dtype="float32", accum_dtype="float32",
+    BLOCK_D=32, BLOCK_K=32, THREADS=256, BLOCK_M=32, SPLIT_M=8,
+):
+    """V3.2 with a 32-column B tile and one float4 task per thread.
+
+    Both shared-memory producers contain exactly 256 float4 groups:
+
+      feature: 32 rows * (32 columns / 4) = 256 groups
+      gradient: 32 rows * (32 columns / 4) = 256 groups
+
+    With 256 threads, ``T.Parallel(32, 8)`` therefore maps one complete
+    float4 to each thread.  A warp covers all eight float4 groups of four
+    complete rows, so the V3.1 16-row half-tile schedule is unnecessary.
+
+    The B layout extends the V3.2 four-group swizzle to eight groups.  XORing
+    by ``(row % 4) * 2`` selects offsets 0, 2, 4, and 6 in float4 units
+    (0, 8, 16, and 24 FP32 words), while the innermost four lanes remain
+    contiguous and 16-byte aligned.
+    """
+    assert SPLIT_M > 0
+    assert dtype == "float32"
+    assert BLOCK_D == 32
+    assert BLOCK_K == 32
+    assert BLOCK_M == 32
+    assert THREADS == 256
+    assert A % 4 == 0
+    assert N % 4 == 0
+    assert EK % 4 == 0
+    assert K % 4 == 0
+    D = A + N + 2 * EK
+    TILES_PER_SPLIT = ((M + BLOCK_M - 1) // BLOCK_M + SPLIT_M - 1) // SPLIT_M
+
+    @T.prim_func
+    def angle_backward_weight_partials(
+        grad_output: T.Tensor((M, K), dtype),
+        flat_angle_ebd: T.Tensor((M, A), dtype),
+        flat_node_ebd: T.Tensor((N_NODE, N), dtype),
+        flat_edge_ebd: T.Tensor((N_EDGE, EK), dtype),
+        n2a_index: T.Tensor((M,), "int64"),
+        eij2a_index: T.Tensor((M,), "int64"),
+        eik2a_index: T.Tensor((M,), "int64"),
+        workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), SPLIT_M, threads=THREADS) as (bx, by, bs):
+            feature_shared = T.alloc_shared((BLOCK_M, BLOCK_D), dtype)
+            grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.annotate_layout({
+                feature_shared: T.Layout(
+                    (BLOCK_M, BLOCK_D),
+                    lambda mi, di: [
+                        mi,
+                        (di // 4) ^ ((mi % 4) * 2),
+                        di % 4,
+                    ],
+                ),
+                grad_shared: T.Layout(
+                    (BLOCK_M, BLOCK_K),
+                    lambda mi, ki: [
+                        mi,
+                        (ki // 4) ^ ((mi % 4) * 2),
+                        ki % 4,
+                    ],
+                ),
+            })
+            T.clear(acc)
+            for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
+                # There are 32 * 8 = 256 float4 tasks.  With 256 threads,
+                # threadIdx.x // 8 selects the row and threadIdx.x % 8 the
+                # group, so every warp covers four complete 128-byte rows.
+                for mi, di4 in T.Parallel(BLOCK_M, BLOCK_D // 4):
+                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                    d_base = bx * BLOCK_D + di4 * 4
+                    if m < M and d_base < D:
+                        if d_base < A:
+                            for vi in T.vectorized(4):
+                                feature_shared[mi, di4 * 4 + vi] = flat_angle_ebd[m, d_base + vi]
+                        elif d_base < A + N:
+                            for vi in T.vectorized(4):
+                                feature_shared[mi, di4 * 4 + vi] = flat_node_ebd[n2a_index[m], d_base - A + vi]
+                        elif d_base < A + N + EK:
+                            for vi in T.vectorized(4):
+                                feature_shared[mi, di4 * 4 + vi] = flat_edge_ebd[eik2a_index[m], d_base - A - N + vi]
+                        else:
+                            for vi in T.vectorized(4):
+                                feature_shared[mi, di4 * 4 + vi] = flat_edge_ebd[eij2a_index[m], d_base - A - N - EK + vi]
+                    else:
+                        for vi in T.vectorized(4):
+                            feature_shared[mi, di4 * 4 + vi] = 0
+
+                # BLOCK_K=32 also gives exactly 32 * 8 = 256 float4 tasks.
+                for mi, ki4 in T.Parallel(BLOCK_M, BLOCK_K // 4):
+                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                    k_base = by * BLOCK_K + ki4 * 4
+                    if m < M and k_base < K:
+                        for vi in T.vectorized(4):
+                            grad_shared[mi, ki4 * 4 + vi] = grad_output[m, k_base + vi]
+                    else:
+                        for vi in T.vectorized(4):
+                            grad_shared[mi, ki4 * 4 + vi] = 0
+                T.sync_threads()
+                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                T.sync_threads()
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < D and k < K:
+                    workspace[bs, d, k] = acc[di, ki]
+    return angle_backward_weight_partials
+
+
+@tilelang.jit
 def fused_angle_update_backward_weights_v2_reduce(
     K, A, N, EK, SPLIT_M=8, accum_dtype="float32",
     BLOCK_D=32, BLOCK_K=16, THREADS=128,
