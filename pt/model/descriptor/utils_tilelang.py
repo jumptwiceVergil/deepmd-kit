@@ -3933,11 +3933,11 @@ def fused_angle_update_backward_weights_v3_1(
 ):
     """V2 with a custom 16-byte-granular XOR layout for the feature tile.
 
-    For FP32, four adjacent elements form one 16-byte group.  XORing the
-    column with an aligned 8-float group selected from the low two row bits
-    keeps those four-element groups intact while distributing each MMA load
-    over all 32 shared-memory banks.  The producer explicitly moves float4
-    groups so the custom layout does not scalarize global loads/shared stores.
+    For FP32, four adjacent elements form one 16-byte group.  The physical
+    layout exposes that group explicitly as ``[row, float4_group, lane]`` and
+    applies XOR only to ``float4_group``.  This is equivalent to XORing the
+    scalar column by an aligned eight-float offset, but keeps ``lane`` as a
+    provably contiguous innermost dimension for vectorized loads/stores.
     """
     assert SPLIT_M > 0
     assert dtype == "float32"
@@ -3964,12 +3964,22 @@ def fused_angle_update_backward_weights_v3_1(
             feature_shared = T.alloc_shared((BLOCK_M, BLOCK_D), dtype)
             grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
             acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
-            # Keep FP32 vectors 16-byte aligned: di[2:0] are unchanged, while
-            # mi[1:0] select one of the four eight-float column groups.
+            # Decompose the physical column into a float4 group and its lane.
+            #
+            #   di ^ ((mi % 4) * 8)
+            # == ((di // 4) ^ ((mi % 4) * 2)) * 4 + di % 4
+            #
+            # The two forms have the same linear shared-memory address.  The
+            # decomposed form makes the vectorized `vi` appear as the final
+            # physical dimension instead of keeping it inside an XOR node.
             T.annotate_layout({
                 feature_shared: T.Layout(
                     (BLOCK_M, BLOCK_D),
-                    lambda mi, di: [mi, di ^ ((mi % 4) * 8)],
+                    lambda mi, di: [
+                        mi,
+                        (di // 4) ^ ((mi % 4) * 2),
+                        di % 4,
+                    ],
                 ),
             })
             T.clear(acc)
