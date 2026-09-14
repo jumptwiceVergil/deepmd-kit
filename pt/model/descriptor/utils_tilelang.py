@@ -3924,6 +3924,158 @@ def fused_angle_update_backward_weights_v2(
                     workspace[bs, d, k] = acc[di, ki]
     return angle_backward_weight_partials
 
+
+@tilelang.jit
+def fused_angle_update_backward_weights_v3_1(
+    M, K, A, N, EK, N_NODE, N_EDGE,
+    dtype="float32", accum_dtype="float32",
+    BLOCK_D=32, BLOCK_K=16, THREADS=128, BLOCK_M=32, SPLIT_M=8,
+):
+    """V2 with a custom 16-byte-granular XOR layout for the feature tile.
+
+    For FP32, four adjacent elements form one 16-byte group.  XORing the
+    column with an aligned group selected from the low three row bits keeps
+    those four-element groups intact while distributing an eight-row MMA
+    access over the eight 16-byte sectors of a 32-float row.
+    """
+    assert SPLIT_M > 0
+    assert dtype == "float32"
+    assert BLOCK_D == 32
+    assert BLOCK_M % 8 == 0
+    D = A + N + 2 * EK
+    TILES_PER_SPLIT = ((M + BLOCK_M - 1) // BLOCK_M + SPLIT_M - 1) // SPLIT_M
+
+    @T.prim_func
+    def angle_backward_weight_partials_v3_1(
+        grad_output: T.Tensor((M, K), dtype),
+        flat_angle_ebd: T.Tensor((M, A), dtype),
+        flat_node_ebd: T.Tensor((N_NODE, N), dtype),
+        flat_edge_ebd: T.Tensor((N_EDGE, EK), dtype),
+        n2a_index: T.Tensor((M,), "int64"),
+        eij2a_index: T.Tensor((M,), "int64"),
+        eik2a_index: T.Tensor((M,), "int64"),
+        workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), SPLIT_M, threads=THREADS) as (bx, by, bs):
+            feature_shared = T.alloc_shared((BLOCK_M, BLOCK_D), dtype)
+            grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            # Keep FP32 vectors 16-byte aligned: di[1:0] are unchanged, while
+            # mi[2:0] select one of the eight four-float column groups.
+            T.annotate_layout({
+                feature_shared: T.Layout(
+                    (BLOCK_M, BLOCK_D),
+                    lambda mi, di: [mi, di ^ ((mi % 8) * 4)],
+                ),
+            })
+            T.clear(acc)
+            for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                    d = bx * BLOCK_D + di
+                    if m < M and d < D:
+                        if d < A:
+                            feature_shared[mi, di] = flat_angle_ebd[m, d]
+                        elif d < A + N:
+                            feature_shared[mi, di] = flat_node_ebd[n2a_index[m], d - A]
+                        elif d < A + N + EK:
+                            feature_shared[mi, di] = flat_edge_ebd[eik2a_index[m], d - A - N]
+                        else:
+                            feature_shared[mi, di] = flat_edge_ebd[eij2a_index[m], d - A - N - EK]
+                    else:
+                        feature_shared[mi, di] = 0
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < M and k < K:
+                        grad_shared[mi, ki] = grad_output[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
+                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                T.sync_threads()
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < D and k < K:
+                    workspace[bs, d, k] = acc[di, ki]
+    return angle_backward_weight_partials_v3_1
+
+
+@tilelang.jit
+def fused_angle_update_backward_weights_v3_2(
+    M, K, A, N, EK, N_NODE, N_EDGE,
+    dtype="float32", accum_dtype="float32",
+    BLOCK_D=32, BLOCK_K=16, THREADS=128, BLOCK_M=32, SPLIT_M=8,
+):
+    """V2 with a padded physical feature layout (logical 32, pitch 33).
+
+    The logical feature tile remains (BLOCK_M, BLOCK_D), so GEMM dimensions do
+    not change.  Its two-dimensional logical index is mapped to a one-dimensional
+    shared-memory offset with one padding element between consecutive rows.
+    """
+    assert SPLIT_M > 0
+    assert BLOCK_D == 32
+    D = A + N + 2 * EK
+    TILES_PER_SPLIT = ((M + BLOCK_M - 1) // BLOCK_M + SPLIT_M - 1) // SPLIT_M
+
+    @T.prim_func
+    def angle_backward_weight_partials_v3_2(
+        grad_output: T.Tensor((M, K), dtype),
+        flat_angle_ebd: T.Tensor((M, A), dtype),
+        flat_node_ebd: T.Tensor((N_NODE, N), dtype),
+        flat_edge_ebd: T.Tensor((N_EDGE, EK), dtype),
+        n2a_index: T.Tensor((M,), "int64"),
+        eij2a_index: T.Tensor((M,), "int64"),
+        eik2a_index: T.Tensor((M,), "int64"),
+        workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), SPLIT_M, threads=THREADS) as (bx, by, bs):
+            feature_shared = T.alloc_shared((BLOCK_M, BLOCK_D), dtype)
+            grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            # Preserve the logical (mi, di) interface while allocating one
+            # unused physical element at the end of every feature row.
+            T.annotate_layout({
+                feature_shared: T.Layout(
+                    (BLOCK_M, BLOCK_D),
+                    lambda mi, di: mi * (BLOCK_D + 1) + di,
+                ),
+            })
+            T.clear(acc)
+            for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                    d = bx * BLOCK_D + di
+                    if m < M and d < D:
+                        if d < A:
+                            feature_shared[mi, di] = flat_angle_ebd[m, d]
+                        elif d < A + N:
+                            feature_shared[mi, di] = flat_node_ebd[n2a_index[m], d - A]
+                        elif d < A + N + EK:
+                            feature_shared[mi, di] = flat_edge_ebd[eik2a_index[m], d - A - N]
+                        else:
+                            feature_shared[mi, di] = flat_edge_ebd[eij2a_index[m], d - A - N - EK]
+                    else:
+                        feature_shared[mi, di] = 0
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                    k = by * BLOCK_K + ki
+                    if m < M and k < K:
+                        grad_shared[mi, ki] = grad_output[m, k]
+                    else:
+                        grad_shared[mi, ki] = 0
+                T.sync_threads()
+                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                T.sync_threads()
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < D and k < K:
+                    workspace[bs, d, k] = acc[di, ki]
+    return angle_backward_weight_partials_v3_2
+
+
 @tilelang.jit
 def fused_angle_update_backward_weights_v2_reduce(
     K, A, N, EK, SPLIT_M=8, accum_dtype="float32",
