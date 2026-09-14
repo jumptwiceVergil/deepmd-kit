@@ -2192,6 +2192,98 @@ def fused_edge_update_weight_backward_v2(
 
 
 @tilelang.jit
+def fused_edge_update_weight_backward_v3(
+    E, K, D_edge, D_node, D_ext, N_node, N_ext,
+    dtype="float32", accum_dtype="float32",
+    BLOCK_D=32, BLOCK_K=32, THREADS=256, BLOCK_M=32, SPLIT_M=4,
+):
+    """V2 with V3.3-style float4 producers and XOR shared layouts."""
+    assert SPLIT_M > 0
+    assert dtype == "float32"
+    assert BLOCK_D == 32
+    assert BLOCK_K == 32
+    assert BLOCK_M == 32
+    assert THREADS == 256
+    # A float4 task must not cross a logical feature-segment boundary.
+    assert D_node % 4 == 0
+    assert D_ext % 4 == 0
+    assert D_edge % 4 == 0
+    assert K % 4 == 0
+    D = D_node + D_ext + D_edge
+    TILES_PER_SPLIT = ((E + BLOCK_M - 1) // BLOCK_M + SPLIT_M - 1) // SPLIT_M
+
+    @T.prim_func
+    def edge_backward_weight_partials(
+        grad_out: T.Tensor((E, K), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        node_ebd: T.Tensor((N_node, D_node), dtype),
+        node_ebd_ext: T.Tensor((N_ext, D_ext), dtype),
+        flat_edge_ebd: T.Tensor((E, D_edge), dtype),
+        workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), SPLIT_M, threads=THREADS) as (bx, by, bs):
+            feature_shared = T.alloc_shared((BLOCK_M, BLOCK_D), dtype)
+            grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.annotate_layout({
+                feature_shared: T.Layout(
+                    (BLOCK_M, BLOCK_D),
+                    lambda mi, di: [
+                        mi,
+                        (di // 4) ^ ((mi % 4) * 2),
+                        di % 4,
+                    ],
+                ),
+                grad_shared: T.Layout(
+                    (BLOCK_M, BLOCK_K),
+                    lambda mi, ki: [
+                        mi,
+                        (ki // 4) ^ ((mi % 4) * 2),
+                        ki % 4,
+                    ],
+                ),
+            })
+            T.clear(acc)
+            for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
+                for mi, di4 in T.Parallel(BLOCK_M, BLOCK_D // 4):
+                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                    d_base = bx * BLOCK_D + di4 * 4
+                    if m < E and d_base < D:
+                        if d_base < D_node:
+                            for vi in T.vectorized(4):
+                                feature_shared[mi, di4 * 4 + vi] = node_ebd[n2e_index[m], d_base + vi]
+                        elif d_base < D_node + D_ext:
+                            for vi in T.vectorized(4):
+                                feature_shared[mi, di4 * 4 + vi] = node_ebd_ext[n_ext2e_index[m], d_base - D_node + vi]
+                        else:
+                            for vi in T.vectorized(4):
+                                feature_shared[mi, di4 * 4 + vi] = flat_edge_ebd[m, d_base - D_node - D_ext + vi]
+                    else:
+                        for vi in T.vectorized(4):
+                            feature_shared[mi, di4 * 4 + vi] = 0
+
+                for mi, ki4 in T.Parallel(BLOCK_M, BLOCK_K // 4):
+                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                    k_base = by * BLOCK_K + ki4 * 4
+                    if m < E and k_base < K:
+                        for vi in T.vectorized(4):
+                            grad_shared[mi, ki4 * 4 + vi] = grad_out[m, k_base + vi]
+                    else:
+                        for vi in T.vectorized(4):
+                            grad_shared[mi, ki4 * 4 + vi] = 0
+                T.sync_threads()
+                T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                T.sync_threads()
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < D and k < K:
+                    workspace[bs, d, k] = acc[di, ki]
+    return edge_backward_weight_partials
+
+
+@tilelang.jit
 def fused_edge_update_weight_backward_v2_reduce(
     K, D_edge, D_node, D_ext, SPLIT_M=4, accum_dtype="float32",
     BLOCK_D=32, BLOCK_K=16, THREADS=128,
@@ -4369,6 +4461,112 @@ def fused_edge_update_double_backward_weights_v2(
                     workspace[bs, d, k] = acc[di, ki]
     return edge_double_backward_weight_partials
 
+
+@tilelang.jit
+def fused_edge_update_double_backward_weights_v3(
+    E, K, D_edge, D_node, D_ext, N_node, N_ext,
+    dtype="float32", accum_dtype="float32",
+    BLOCK_D=32, BLOCK_K=32, THREADS=256, BLOCK_M=32, SPLIT_M=4,
+    HAS_NODE=True, HAS_EXT=True, HAS_EDGE=True,
+):
+    """V2 with V3.3-style float4 producers and XOR shared layouts."""
+    assert SPLIT_M > 0
+    assert dtype == "float32"
+    assert BLOCK_D == 32
+    assert BLOCK_K == 32
+    assert BLOCK_M == 32
+    assert THREADS == 256
+    assert D_node % 4 == 0
+    assert D_ext % 4 == 0
+    assert D_edge % 4 == 0
+    assert K % 4 == 0
+    D = D_node + D_ext + D_edge
+    TILES_PER_SPLIT = ((E + BLOCK_M - 1) // BLOCK_M + SPLIT_M - 1) // SPLIT_M
+
+    @T.prim_func
+    def edge_double_backward_weight_partials(
+        grad_out: T.Tensor((E, K), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        grad_grad_node: T.Tensor((N_node, D_node), dtype),
+        grad_grad_node_ext: T.Tensor((N_ext, D_ext), dtype),
+        grad_grad_edge_ebd: T.Tensor((E, D_edge), dtype),
+        workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), SPLIT_M, threads=THREADS) as (bx, by, bs):
+            feature_shared = T.alloc_shared((BLOCK_M, BLOCK_D), dtype)
+            grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.annotate_layout({
+                feature_shared: T.Layout(
+                    (BLOCK_M, BLOCK_D),
+                    lambda mi, di: [
+                        mi,
+                        (di // 4) ^ ((mi % 4) * 2),
+                        di % 4,
+                    ],
+                ),
+                grad_shared: T.Layout(
+                    (BLOCK_M, BLOCK_K),
+                    lambda mi, ki: [
+                        mi,
+                        (ki // 4) ^ ((mi % 4) * 2),
+                        ki % 4,
+                    ],
+                ),
+            })
+            T.clear(acc)
+            if (HAS_NODE and bx * BLOCK_D < D_node) or (HAS_EXT and bx * BLOCK_D < D_node + D_ext and (bx + 1) * BLOCK_D > D_node) or (HAS_EDGE and (bx + 1) * BLOCK_D > D_node + D_ext):
+                for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
+                    for mi, di4 in T.Parallel(BLOCK_M, BLOCK_D // 4):
+                        m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                        d_base = bx * BLOCK_D + di4 * 4
+                        if m < E and d_base < D:
+                            if d_base < D_node:
+                                if HAS_NODE:
+                                    for vi in T.vectorized(4):
+                                        feature_shared[mi, di4 * 4 + vi] = grad_grad_node[n2e_index[m], d_base + vi]
+                                else:
+                                    for vi in T.vectorized(4):
+                                        feature_shared[mi, di4 * 4 + vi] = 0
+                            elif d_base < D_node + D_ext:
+                                if HAS_EXT:
+                                    for vi in T.vectorized(4):
+                                        feature_shared[mi, di4 * 4 + vi] = grad_grad_node_ext[n_ext2e_index[m], d_base - D_node + vi]
+                                else:
+                                    for vi in T.vectorized(4):
+                                        feature_shared[mi, di4 * 4 + vi] = 0
+                            else:
+                                if HAS_EDGE:
+                                    for vi in T.vectorized(4):
+                                        feature_shared[mi, di4 * 4 + vi] = grad_grad_edge_ebd[m, d_base - D_node - D_ext + vi]
+                                else:
+                                    for vi in T.vectorized(4):
+                                        feature_shared[mi, di4 * 4 + vi] = 0
+                        else:
+                            for vi in T.vectorized(4):
+                                feature_shared[mi, di4 * 4 + vi] = 0
+
+                    for mi, ki4 in T.Parallel(BLOCK_M, BLOCK_K // 4):
+                        m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                        k_base = by * BLOCK_K + ki4 * 4
+                        if m < E and k_base < K:
+                            for vi in T.vectorized(4):
+                                grad_shared[mi, ki4 * 4 + vi] = grad_out[m, k_base + vi]
+                        else:
+                            for vi in T.vectorized(4):
+                                grad_shared[mi, ki4 * 4 + vi] = 0
+                    T.sync_threads()
+                    T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                    T.sync_threads()
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < D and k < K:
+                    workspace[bs, d, k] = acc[di, ki]
+    return edge_double_backward_weight_partials
+
+
 @tilelang.jit
 def fused_edge_update_double_backward_weights_v2_reduce(
     K, D_edge, D_node, D_ext, SPLIT_M=4, accum_dtype="float32",
@@ -4481,6 +4679,119 @@ def fused_angle_update_double_backward_weights_v2(
                             grad_shared[mi, ki] = grad_output[m, k]
                         else:
                             grad_shared[mi, ki] = 0
+                    T.sync_threads()
+                    T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
+                    T.sync_threads()
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < D and k < K:
+                    workspace[bs, d, k] = acc[di, ki]
+    return angle_double_backward_weight_partials
+
+
+@tilelang.jit
+def fused_angle_update_double_backward_weights_v3(
+    M, K, A, N, EK, N_NODE, N_EDGE,
+    dtype="float32", accum_dtype="float32",
+    BLOCK_D=32, BLOCK_K=32, THREADS=256, BLOCK_M=32, SPLIT_M=8,
+    HAS_ANGLE=True, HAS_NODE=True, HAS_EDGE=True,
+):
+    """V2 with V3.3-style float4 producers and XOR shared layouts."""
+    assert SPLIT_M > 0
+    assert dtype == "float32"
+    assert BLOCK_D == 32
+    assert BLOCK_K == 32
+    assert BLOCK_M == 32
+    assert THREADS == 256
+    assert A % 4 == 0
+    assert N % 4 == 0
+    assert EK % 4 == 0
+    assert K % 4 == 0
+    D = A + N + 2 * EK
+    TILES_PER_SPLIT = ((M + BLOCK_M - 1) // BLOCK_M + SPLIT_M - 1) // SPLIT_M
+
+    @T.prim_func
+    def angle_double_backward_weight_partials(
+        grad_output: T.Tensor((M, K), dtype),
+        gg_flat_angle: T.Tensor((M, A), dtype),
+        gg_flat_node: T.Tensor((N_NODE, N), dtype),
+        gg_flat_edge: T.Tensor((N_EDGE, EK), dtype),
+        n2a_index: T.Tensor((M,), "int64"),
+        eij2a_index: T.Tensor((M,), "int64"),
+        eik2a_index: T.Tensor((M,), "int64"),
+        workspace: T.Tensor((SPLIT_M, D, K), accum_dtype),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(K, BLOCK_K), SPLIT_M, threads=THREADS) as (bx, by, bs):
+            feature_shared = T.alloc_shared((BLOCK_M, BLOCK_D), dtype)
+            grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.annotate_layout({
+                feature_shared: T.Layout(
+                    (BLOCK_M, BLOCK_D),
+                    lambda mi, di: [
+                        mi,
+                        (di // 4) ^ ((mi % 4) * 2),
+                        di % 4,
+                    ],
+                ),
+                grad_shared: T.Layout(
+                    (BLOCK_M, BLOCK_K),
+                    lambda mi, ki: [
+                        mi,
+                        (ki // 4) ^ ((mi % 4) * 2),
+                        ki % 4,
+                    ],
+                ),
+            })
+            T.clear(acc)
+            if (HAS_ANGLE and bx * BLOCK_D < A) or (HAS_NODE and bx * BLOCK_D < A + N and (bx + 1) * BLOCK_D > A) or (HAS_EDGE and (bx + 1) * BLOCK_D > A + N):
+                for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
+                    for mi, di4 in T.Parallel(BLOCK_M, BLOCK_D // 4):
+                        m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                        d_base = bx * BLOCK_D + di4 * 4
+                        if m < M and d_base < D:
+                            if d_base < A:
+                                if HAS_ANGLE:
+                                    for vi in T.vectorized(4):
+                                        feature_shared[mi, di4 * 4 + vi] = gg_flat_angle[m, d_base + vi]
+                                else:
+                                    for vi in T.vectorized(4):
+                                        feature_shared[mi, di4 * 4 + vi] = 0
+                            elif d_base < A + N:
+                                if HAS_NODE:
+                                    for vi in T.vectorized(4):
+                                        feature_shared[mi, di4 * 4 + vi] = gg_flat_node[n2a_index[m], d_base - A + vi]
+                                else:
+                                    for vi in T.vectorized(4):
+                                        feature_shared[mi, di4 * 4 + vi] = 0
+                            elif d_base < A + N + EK:
+                                if HAS_EDGE:
+                                    for vi in T.vectorized(4):
+                                        feature_shared[mi, di4 * 4 + vi] = gg_flat_edge[eik2a_index[m], d_base - A - N + vi]
+                                else:
+                                    for vi in T.vectorized(4):
+                                        feature_shared[mi, di4 * 4 + vi] = 0
+                            else:
+                                if HAS_EDGE:
+                                    for vi in T.vectorized(4):
+                                        feature_shared[mi, di4 * 4 + vi] = gg_flat_edge[eij2a_index[m], d_base - A - N - EK + vi]
+                                else:
+                                    for vi in T.vectorized(4):
+                                        feature_shared[mi, di4 * 4 + vi] = 0
+                        else:
+                            for vi in T.vectorized(4):
+                                feature_shared[mi, di4 * 4 + vi] = 0
+
+                    for mi, ki4 in T.Parallel(BLOCK_M, BLOCK_K // 4):
+                        m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                        k_base = by * BLOCK_K + ki4 * 4
+                        if m < M and k_base < K:
+                            for vi in T.vectorized(4):
+                                grad_shared[mi, ki4 * 4 + vi] = grad_output[m, k_base + vi]
+                        else:
+                            for vi in T.vectorized(4):
+                                grad_shared[mi, ki4 * 4 + vi] = 0
                     T.sync_threads()
                     T.gemm(feature_shared, grad_shared, acc, transpose_A=True)
                     T.sync_threads()
