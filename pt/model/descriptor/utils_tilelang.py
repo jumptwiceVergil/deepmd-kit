@@ -5577,7 +5577,7 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
             (split_m, A + N + 2 * EK, K),
             device=grad_output.device, dtype=grad_output.dtype,
         )
-        weight_kernel = fused_angle_update_backward_weights_v3_1(
+        weight_kernel = fused_angle_update_backward_weights_v3_3(
             M=M, K=K, A=A, N=N, EK=EK, N_NODE=N_NODE, N_EDGE=N_EDGE,
             dtype=dtype, accum_dtype=dtype, SPLIT_M=split_m,
         )
