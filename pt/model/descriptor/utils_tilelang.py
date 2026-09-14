@@ -3942,7 +3942,8 @@ def fused_angle_update_backward_weights_v3_1(
     assert SPLIT_M > 0
     assert dtype == "float32"
     assert BLOCK_D == 32
-    assert BLOCK_M % 8 == 0
+    assert BLOCK_M == 32
+    assert THREADS == 128
     assert A % 4 == 0
     assert N % 4 == 0
     assert EK % 4 == 0
@@ -3984,28 +3985,32 @@ def fused_angle_update_backward_weights_v3_1(
             })
             T.clear(acc)
             for mo in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
-                # One parallel iteration owns four consecutive FP32 values.
-                # Segment selection is outside T.vectorized so all four lanes
-                # use one source tensor and can lower to a float4 transaction.
-                for mi, di4 in T.Parallel(BLOCK_M, BLOCK_D // 4):
-                    m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
-                    d_base = bx * BLOCK_D + di4 * 4
-                    if m < M and d_base < D:
-                        if d_base < A:
-                            for vi in T.vectorized(4):
-                                feature_shared[mi, di4 * 4 + vi] = flat_angle_ebd[m, d_base + vi]
-                        elif d_base < A + N:
-                            for vi in T.vectorized(4):
-                                feature_shared[mi, di4 * 4 + vi] = flat_node_ebd[n2a_index[m], d_base - A + vi]
-                        elif d_base < A + N + EK:
-                            for vi in T.vectorized(4):
-                                feature_shared[mi, di4 * 4 + vi] = flat_edge_ebd[eik2a_index[m], d_base - A - N + vi]
+                # Schedule one complete 16-row half tile at a time.  Each
+                # T.Parallel(16, 8) has exactly 128 float4 tasks, so within a
+                # warp di4 runs through all eight groups for four complete
+                # rows.  This keeps both the global LDG.128 sectors and the
+                # shared STS.128 bank wavefronts contiguous/minimal.
+                for m_half in T.unroll(2):
+                    for mi_inner, di4 in T.Parallel(BLOCK_M // 2, BLOCK_D // 4):
+                        mi = m_half * (BLOCK_M // 2) + mi_inner
+                        m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
+                        d_base = bx * BLOCK_D + di4 * 4
+                        if m < M and d_base < D:
+                            if d_base < A:
+                                for vi in T.vectorized(4):
+                                    feature_shared[mi, di4 * 4 + vi] = flat_angle_ebd[m, d_base + vi]
+                            elif d_base < A + N:
+                                for vi in T.vectorized(4):
+                                    feature_shared[mi, di4 * 4 + vi] = flat_node_ebd[n2a_index[m], d_base - A + vi]
+                            elif d_base < A + N + EK:
+                                for vi in T.vectorized(4):
+                                    feature_shared[mi, di4 * 4 + vi] = flat_edge_ebd[eik2a_index[m], d_base - A - N + vi]
+                            else:
+                                for vi in T.vectorized(4):
+                                    feature_shared[mi, di4 * 4 + vi] = flat_edge_ebd[eij2a_index[m], d_base - A - N - EK + vi]
                         else:
                             for vi in T.vectorized(4):
-                                feature_shared[mi, di4 * 4 + vi] = flat_edge_ebd[eij2a_index[m], d_base - A - N - EK + vi]
-                    else:
-                        for vi in T.vectorized(4):
-                            feature_shared[mi, di4 * 4 + vi] = 0
+                                feature_shared[mi, di4 * 4 + vi] = 0
                 for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
                     m = (bs * TILES_PER_SPLIT + mo) * BLOCK_M + mi
                     k = by * BLOCK_K + ki
