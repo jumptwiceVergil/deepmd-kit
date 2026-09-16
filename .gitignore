@@ -7,6 +7,7 @@ build/
 __pycache__/
 .codex_analysis/
 .ruff_cache/
+.pytest_cache/
 
 # 忽略所有模型文件
 *.pth
