@@ -2972,12 +2972,12 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
             (split_m, D_node + D_ext + D_edge, K),
             device=grad_out.device, dtype=grad_out.dtype,
         )
-        weight_kernel_v2 = fused_edge_update_weight_backward_v2(
+        weight_kernel = fused_edge_update_weight_backward_v3(
             E=E, K=K, D_edge=D_edge, D_node=D_node, D_ext=D_ext,
             N_node=N_node, N_ext=N_ext, dtype=dtype, accum_dtype=dtype,
             SPLIT_M=split_m,
         )
-        weight_kernel_v2(
+        weight_kernel(
             grad_out, n2e_index, n_ext2e_index,
             node_ebd, node_ebd_ext, flat_edge_ebd, workspace,
         )
@@ -3292,13 +3292,13 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
             (split_m, D_node + D_ext + D_edge, K),
             dtype=grad_out.dtype, device=grad_out.device,
         )
-        weight_kernel_v2 = fused_edge_update_double_backward_weights_v2(
+        weight_kernel = fused_edge_update_double_backward_weights_v3(
             E=E, K=K, D_edge=D_edge, D_node=D_node, D_ext=D_ext,
             N_node=N_node, N_ext=N_ext, dtype=dtype,
             accum_dtype=dtype, SPLIT_M=split_m,
             HAS_NODE=HAS_NODE, HAS_EXT=HAS_EXT, HAS_EDGE=HAS_EDGE,
         )
-        weight_kernel_v2(
+        weight_kernel(
             grad_out, n2e_index, n_ext2e_index,
             grad_grad_node if HAS_NODE else node_ebd,
             grad_grad_node_ext if HAS_EXT else node_ebd_ext,
@@ -6167,17 +6167,17 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
         #     grad_sub_edge_ik,
         #     grad_sub_edge_ij,
         # )
-        split_m = min(32, max(1, (M + 31) // 32))
+        split_m = min(132, max(1, (M + 31) // 32))
         workspace = torch.empty(
             (split_m, A + N + 2 * EK, K),
             dtype=grad_output.dtype, device=grad_output.device,
         )
-        weight_kernel_v2 = fused_angle_update_double_backward_weights_v2(
+        weight_kernel = fused_angle_update_double_backward_weights_v3(
             M=M, K=K, A=A, N=N, EK=EK, N_NODE=N_NODE, N_EDGE=N_EDGE,
             dtype=dtype, accum_dtype=dtype, SPLIT_M=split_m,
             HAS_ANGLE=HAS_ANGLE, HAS_NODE=HAS_NODE, HAS_EDGE=HAS_EDGE,
         )
-        weight_kernel_v2(
+        weight_kernel(
             grad_output,
             grad_grad_flat_angle_ebd if HAS_ANGLE else flat_angle_ebd,
             grad_grad_flat_node_ebd if HAS_NODE else flat_node_ebd,
