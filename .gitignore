@@ -1,2 +1,13 @@
 pkg_config
 run_config.ini
+
+# 忽略目录
+.env/
+build/
+__pycache__/
+.codex_analysis/
+.ruff_cache/
+
+# 忽略所有模型文件
+*.pth
+*.ckpt

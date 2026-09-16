@@ -2325,7 +2325,7 @@ def fused_edge_update_weight_backward_v2_reduce(
 
 
 @tilelang.jit
-def fused_edge_update_input_backward_v2(
+def fused_edge_update_backward_inputs_v2(
     E, K, D_edge, D_node, D_ext, N_node, N_ext,
     dtype="float32", accum_dtype="float32",
     BLOCK_E=32, BLOCK_D=32, BLOCK_K=32, THREADS=128,
@@ -2339,7 +2339,7 @@ def fused_edge_update_input_backward_v2(
     D = D_edge + D_node + D_ext
 
     @T.prim_func
-    def input_backward(
+    def edge_backward_inputs(
         grad_out: T.Tensor((E, K), dtype),
         edge_weight: T.Tensor((D_edge, K), dtype),
         node_weight: T.Tensor((D_node, K), dtype),
@@ -2408,7 +2408,7 @@ def fused_edge_update_input_backward_v2(
                         k = ko * BLOCK_K + ki
                         if k < K:
                             T.atomic_add(grad_bias[k], bias_tile[ki])
-    return input_backward
+    return edge_backward_inputs
 
 
 @tilelang.jit
@@ -2435,7 +2435,7 @@ def fused_edge_update_double_backward_inputs(
     """
 
     @T.prim_func
-    def double_backward_inputs(
+    def edge_double_backward_inputs(
         grad_out: T.Tensor((E, K), dtype),
         node_ebd: T.Tensor((N_node, D_node), dtype),
         node_ebd_ext: T.Tensor((N_ext, D_ext), dtype),
@@ -2730,7 +2730,7 @@ def fused_edge_update_double_backward_inputs(
                         T.atomic_add(grad_node_ebd_ext[n_ext2e_index[m], n], acc_input[mi, ni])
                 T.sync_threads()
 
-    return double_backward_inputs
+    return edge_double_backward_inputs
 
 
 @tilelang.jit
@@ -3035,7 +3035,7 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
         #     grad_node_ext,
         #     grad_bias,
         # )
-        input_kernel = fused_edge_update_input_backward_v2(
+        input_kernel = fused_edge_update_backward_inputs_v2(
             E=E,
             K=K,
             D_edge=D_edge,
@@ -3608,7 +3608,7 @@ def fused_angle_update_backward_inputs(
     MAX_D = max(A, N, EK)
 
     @T.prim_func
-    def backward_inputs(
+    def angle_backward_inputs(
         grad_output: T.Tensor((M, K), dtype),
         n2a_index: T.Tensor((M,), "int64"),
         eij2a_index: T.Tensor((M,), "int64"),
@@ -3763,7 +3763,7 @@ def fused_angle_update_backward_inputs(
                     T.atomic_add(grad_flat_edge[eik2a_index[m], d], acc_ik[mi, di])
                     T.atomic_add(grad_flat_edge[eij2a_index[m], d], acc_ij[mi, di])
 
-    return backward_inputs
+    return angle_backward_inputs
 
 
 @tilelang.jit
@@ -5205,7 +5205,7 @@ def fused_angle_update_double_backward_inputs(
     """
 
     @T.prim_func
-    def double_backward_inputs(
+    def angle_double_backward_inputs(
         grad_output: T.Tensor((M, K), dtype),
         flat_angle_ebd: T.Tensor((M, A), dtype),
         flat_node_ebd: T.Tensor((N_NODE, N), dtype),
@@ -5580,7 +5580,7 @@ def fused_angle_update_double_backward_inputs(
                         T.atomic_add(grad_flat_edge[eij2a_index[m], n], acc_input[mi, ni])
                 T.sync_threads()
 
-    return double_backward_inputs
+    return angle_double_backward_inputs
 
 
 @tilelang.jit
