@@ -1156,7 +1156,7 @@ class Trainer:
             self.last_display_step = 0
         
         for step_id in range(self.start_step, self.num_steps):
-            if step_id > 30:
+            if step_id > 10:
                 import sys
                 sys.exit(0)
                 assert False

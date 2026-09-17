@@ -2353,7 +2353,7 @@ def fused_edge_update_backward_inputs_v2(
     ):
         with T.Kernel(T.ceildiv(E, BLOCK_E), T.ceildiv(D, BLOCK_D), threads=THREADS) as (bx, by):
             grad_shared = T.alloc_shared((BLOCK_E, BLOCK_K), dtype)
-            weight_shared = T.alloc_shared((BLOCK_K, BLOCK_D), dtype)
+            weight_shared = T.alloc_shared((BLOCK_D, BLOCK_K), dtype)
             acc = T.alloc_fragment((BLOCK_E, BLOCK_D), accum_dtype)
             bias_tile = T.alloc_fragment((BLOCK_K,), accum_dtype)
             T.clear(acc)
@@ -2365,20 +2365,20 @@ def fused_edge_update_backward_inputs_v2(
                         grad_shared[ei, ki] = grad_out[e, k]
                     else:
                         grad_shared[ei, ki] = 0
-                for ki, di in T.Parallel(BLOCK_K, BLOCK_D):
+                for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
                     k = ko * BLOCK_K + ki
                     d = by * BLOCK_D + di
                     if k < K and d < D:
                         if d < D_edge:
-                            weight_shared[ki, di] = edge_weight[d, k]
+                            weight_shared[di, ki] = edge_weight[d, k]
                         elif d < D_edge + D_node:
-                            weight_shared[ki, di] = node_weight[d - D_edge, k]
+                            weight_shared[di, ki] = node_weight[d - D_edge, k]
                         else:
-                            weight_shared[ki, di] = node_ext_weight[d - D_edge - D_node, k]
+                            weight_shared[di, ki] = node_ext_weight[d - D_edge - D_node, k]
                     else:
-                        weight_shared[ki, di] = 0
+                        weight_shared[di, ki] = 0
                 T.sync_threads()
-                T.gemm(grad_shared, weight_shared, acc)
+                T.gemm(grad_shared, weight_shared, acc, transpose_B=True)
                 T.sync_threads()
             # Separate writeback; gather's adjoint is scatter-add, not a split.
             for ei, di in T.Parallel(BLOCK_E, BLOCK_D):

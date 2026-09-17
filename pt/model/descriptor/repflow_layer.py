@@ -1473,7 +1473,7 @@ class RepFlowLayer(torch.nn.Module):
                     "node",
                 )
                 if not self.use_dynamic_sel
-                else self.optim_edge_update_dynamic(
+                else self.fused_optim_edge_update_dynamic(
                     node_ebd,
                     node_ebd_ext,
                     edge_ebd,
@@ -1525,7 +1525,7 @@ class RepFlowLayer(torch.nn.Module):
                     "edge",
                 )
                 if not self.use_dynamic_sel
-                else self.optim_edge_update_dynamic(
+                else self.fused_optim_edge_update_dynamic(
                     node_ebd,
                     node_ebd_ext,
                     edge_ebd,
@@ -1623,7 +1623,7 @@ class RepFlowLayer(torch.nn.Module):
                         "edge",
                     )
                     if not self.use_dynamic_sel
-                    else self.fused_optim_angle_update_dynamic(
+                    else self.optim_angle_update_dynamic(
                         angle_ebd,
                         node_ebd_for_angle,
                         edge_ebd_for_angle,
@@ -1712,7 +1712,7 @@ class RepFlowLayer(torch.nn.Module):
                         "angle",
                     )
                     if not self.use_dynamic_sel
-                    else self.fused_optim_angle_update_dynamic(
+                    else self.optim_angle_update_dynamic(
                         angle_ebd,
                         node_ebd_for_angle,
                         edge_ebd_for_angle,
