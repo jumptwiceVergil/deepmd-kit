@@ -2656,11 +2656,11 @@ def fused_edge_update_double_backward_inputs(
                             r = ro * BLOCK_K + ri
                             n = by * BLOCK_N + ni
                             if r < K and n < D_edge:
-                                rhs_shared[ri, ni] = grad_grad_edge_weight[n, r]
+                                rhs_shared[ri, ni] = grad_grad_edge_weight[r, n]
                             else:
                                 rhs_shared[ri, ni] = 0
                         T.sync_threads()
-                        T.gemm(lhs_shared, rhs_shared, acc_input)
+                        T.gemm(lhs_shared, rhs_shared, acc_input, transpose_B=True)
                         T.sync_threads()
                 T.sync_threads()
                 for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
@@ -2686,11 +2686,11 @@ def fused_edge_update_double_backward_inputs(
                             r = ro * BLOCK_K + ri
                             n = by * BLOCK_N + ni
                             if r < K and n < D_node:
-                                rhs_shared[ri, ni] = grad_grad_node_weight[n, r]
+                                rhs_shared[ri, ni] = grad_grad_node_weight[r, n]
                             else:
                                 rhs_shared[ri, ni] = 0
                         T.sync_threads()
-                        T.gemm(lhs_shared, rhs_shared, acc_input)
+                        T.gemm(lhs_shared, rhs_shared, acc_input, transpose_B=True)
                         T.sync_threads()
                 T.sync_threads()
                 for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
@@ -2716,11 +2716,11 @@ def fused_edge_update_double_backward_inputs(
                             r = ro * BLOCK_K + ri
                             n = by * BLOCK_N + ni
                             if r < K and n < D_ext:
-                                rhs_shared[ri, ni] = grad_grad_node_ext_weight[n, r]
+                                rhs_shared[ri, ni] = grad_grad_node_ext_weight[r, n]
                             else:
                                 rhs_shared[ri, ni] = 0
                         T.sync_threads()
-                        T.gemm(lhs_shared, rhs_shared, acc_input)
+                        T.gemm(lhs_shared, rhs_shared, acc_input, transpose_B=True)
                         T.sync_threads()
                 T.sync_threads()
                 for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
@@ -5584,11 +5584,11 @@ def fused_angle_update_double_backward_inputs(
                             r = ro * BLOCK_K + ri
                             n = by * BLOCK_N + ni
                             if r < K and n < A:
-                                rhs_shared[ri, ni] = gg_sub_angle[n, r]
+                                rhs_shared[ri, ni] = gg_sub_angle[r, n]
                             else:
                                 rhs_shared[ri, ni] = 0
                         T.sync_threads()
-                        T.gemm(lhs_shared, rhs_shared, acc_input)
+                        T.gemm(lhs_shared, rhs_shared, acc_input, transpose_B=True)
                         T.sync_threads()
                 T.sync_threads()
                 for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
@@ -5614,11 +5614,11 @@ def fused_angle_update_double_backward_inputs(
                             r = ro * BLOCK_K + ri
                             n = by * BLOCK_N + ni
                             if r < K and n < N:
-                                rhs_shared[ri, ni] = gg_sub_node[n, r]
+                                rhs_shared[ri, ni] = gg_sub_node[r, n]
                             else:
                                 rhs_shared[ri, ni] = 0
                         T.sync_threads()
-                        T.gemm(lhs_shared, rhs_shared, acc_input)
+                        T.gemm(lhs_shared, rhs_shared, acc_input, transpose_B=True)
                         T.sync_threads()
                 T.sync_threads()
                 for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
@@ -5644,11 +5644,11 @@ def fused_angle_update_double_backward_inputs(
                             r = ro * BLOCK_K + ri
                             n = by * BLOCK_N + ni
                             if r < K and n < EK:
-                                rhs_shared[ri, ni] = gg_sub_edge_ik[n, r]
+                                rhs_shared[ri, ni] = gg_sub_edge_ik[r, n]
                             else:
                                 rhs_shared[ri, ni] = 0
                         T.sync_threads()
-                        T.gemm(lhs_shared, rhs_shared, acc_input)
+                        T.gemm(lhs_shared, rhs_shared, acc_input, transpose_B=True)
                         T.sync_threads()
                 T.sync_threads()
                 for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
@@ -5674,11 +5674,11 @@ def fused_angle_update_double_backward_inputs(
                             r = ro * BLOCK_K + ri
                             n = by * BLOCK_N + ni
                             if r < K and n < EK:
-                                rhs_shared[ri, ni] = gg_sub_edge_ij[n, r]
+                                rhs_shared[ri, ni] = gg_sub_edge_ij[r, n]
                             else:
                                 rhs_shared[ri, ni] = 0
                         T.sync_threads()
-                        T.gemm(lhs_shared, rhs_shared, acc_input)
+                        T.gemm(lhs_shared, rhs_shared, acc_input, transpose_B=True)
                         T.sync_threads()
                 T.sync_threads()
                 for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
