@@ -1343,7 +1343,7 @@ def fused_edge_update_forward(
     BLK_K: int = 64,
 ):
     @T.prim_func
-    def kernel(
+    def edge_forward(
         node_ebd: T.Tensor((N_NODES_LOC, NODE_DIM), "float32"),
         node_ebd_ext: T.Tensor((N_NODES_EXT, NODE_DIM), "float32"),
         flat_edge_ebd: T.Tensor((N_EDGES, EDGE_DIM), "float32"),
@@ -1438,7 +1438,7 @@ def fused_edge_update_forward(
             for i, j in T.Parallel(BLK_M, BLK_N):
                 if (bx * BLK_M + i < N_EDGES and by * BLK_N + j < OUT_DIM):
                     out[bx * BLK_M + i, by * BLK_N + j] = acc[i, j] + bias[by * BLK_N + j]
-    return kernel
+    return edge_forward
 
 @tilelang.jit
 def fused_edge_update_backward(
@@ -3339,7 +3339,7 @@ def fused_angle_update_forward(
     BLK_K: int = 32,
 ):
     @T.prim_func
-    def fused_angle_update(
+    def angle_forward(
         flat_angle_ebd: T.Tensor((N_ANGLE, ANGLE_DIM), "float32"),
         node_ebd: T.Tensor((N_NODE, NODE_DIM), "float32"),
         flat_edge_ebd: T.Tensor((N_EDGE, EDGE_DIM), "float32"),
@@ -3454,7 +3454,7 @@ def fused_angle_update_forward(
             for i, j in T.Parallel(BLK_M, BLK_N):
                 if (bx * BLK_M + i < N_ANGLE and by * BLK_N + j < OUT_DIM):
                     out[bx * BLK_M + i, by * BLK_N + j] = T.cast(acc[i, j], "float32") + bias[by * BLK_N + j]
-    return fused_angle_update
+    return angle_forward
 
 class FusedAngleUpdateFunction(torch.autograd.Function):
     @staticmethod
