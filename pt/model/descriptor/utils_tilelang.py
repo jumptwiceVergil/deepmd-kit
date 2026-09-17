@@ -2284,6 +2284,111 @@ def fused_edge_update_weight_backward_v3(
 
 
 @tilelang.jit
+def fused_edge_update_weight_backward_v4(
+    E, K, D_edge, D_node, D_ext, N_node, N_ext,
+    dtype="float32", accum_dtype="float32",
+    BLOCK_D=32, BLOCK_K=32, THREADS=256, BLOCK_M=32,
+):
+    """Compute edge-update weight gradients without split-E partials.
+
+    This variant keeps V3's float4 producer mapping, but uses the default
+    shared-memory layouts.  A single kernel traverses the full reduction
+    dimension and writes the three weight-gradient outputs directly.
+    """
+    assert dtype == "float32"
+    assert BLOCK_D == 32
+    assert BLOCK_K == 32
+    assert BLOCK_M == 32
+    assert THREADS == 256
+    # A float4 task must not cross a logical feature-segment boundary.
+    assert D_node % 4 == 0
+    assert D_ext % 4 == 0
+    assert D_edge % 4 == 0
+    assert K % 4 == 0
+    D = D_node + D_ext + D_edge
+
+    @T.prim_func
+    def edge_backward_weight(
+        grad_out: T.Tensor((E, K), dtype),
+        n2e_index: T.Tensor((E,), "int64"),
+        n_ext2e_index: T.Tensor((E,), "int64"),
+        node_ebd: T.Tensor((N_node, D_node), dtype),
+        node_ebd_ext: T.Tensor((N_ext, D_ext), dtype),
+        flat_edge_ebd: T.Tensor((E, D_edge), dtype),
+        grad_node_weight: T.Tensor((D_node, K), accum_dtype),
+        grad_node_ext_weight: T.Tensor((D_ext, K), accum_dtype),
+        grad_edge_weight: T.Tensor((D_edge, K), accum_dtype),
+    ):
+        with T.Kernel(
+            T.ceildiv(D, BLOCK_D),
+            T.ceildiv(K, BLOCK_K),
+            threads=THREADS,
+        ) as (bx, by):
+            feature_shared = T.alloc_shared((BLOCK_M, BLOCK_D), dtype)
+            grad_shared = T.alloc_shared((BLOCK_M, BLOCK_K), dtype)
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_K), accum_dtype)
+            T.clear(acc)
+
+            for mo in T.Pipelined(T.ceildiv(E, BLOCK_M), num_stages=2):
+                for mi, di4 in T.Parallel(BLOCK_M, BLOCK_D // 4):
+                    m = mo * BLOCK_M + mi
+                    d_base = bx * BLOCK_D + di4 * 4
+                    if m < E and d_base < D:
+                        if d_base < D_node:
+                            for vi in T.vectorized(4):
+                                feature_shared[mi, di4 * 4 + vi] = node_ebd[
+                                    n2e_index[m], d_base + vi
+                                ]
+                        elif d_base < D_node + D_ext:
+                            for vi in T.vectorized(4):
+                                feature_shared[mi, di4 * 4 + vi] = node_ebd_ext[
+                                    n_ext2e_index[m], d_base - D_node + vi
+                                ]
+                        else:
+                            for vi in T.vectorized(4):
+                                feature_shared[mi, di4 * 4 + vi] = flat_edge_ebd[
+                                    m, d_base - D_node - D_ext + vi
+                                ]
+                    else:
+                        for vi in T.vectorized(4):
+                            feature_shared[mi, di4 * 4 + vi] = 0
+
+                for mi, ki4 in T.Parallel(BLOCK_M, BLOCK_K // 4):
+                    m = mo * BLOCK_M + mi
+                    k_base = by * BLOCK_K + ki4 * 4
+                    if m < E and k_base < K:
+                        for vi in T.vectorized(4):
+                            grad_shared[mi, ki4 * 4 + vi] = grad_out[
+                                m, k_base + vi
+                            ]
+                    else:
+                        for vi in T.vectorized(4):
+                            grad_shared[mi, ki4 * 4 + vi] = 0
+
+                T.sync_threads()
+                T.gemm(
+                    feature_shared,
+                    grad_shared,
+                    acc,
+                    transpose_A=True,
+                )
+                T.sync_threads()
+
+            for di, ki in T.Parallel(BLOCK_D, BLOCK_K):
+                d = bx * BLOCK_D + di
+                k = by * BLOCK_K + ki
+                if d < D and k < K:
+                    if d < D_node:
+                        grad_node_weight[d, k] = acc[di, ki]
+                    elif d < D_node + D_ext:
+                        grad_node_ext_weight[d - D_node, k] = acc[di, ki]
+                    else:
+                        grad_edge_weight[d - D_node - D_ext, k] = acc[di, ki]
+
+    return edge_backward_weight
+
+
+@tilelang.jit
 def fused_edge_update_weight_backward_v2_reduce(
     K, D_edge, D_node, D_ext, SPLIT_M=4, accum_dtype="float32",
     BLOCK_D=32, BLOCK_K=16, THREADS=128,
@@ -2967,27 +3072,36 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
         #     grad_node_ext_weight,
         # )
         dtype = str(grad_out.dtype).replace("torch.", "")
-        split_m = min(4, max(1, (E + 31) // 32))
-        workspace = torch.empty(
-            (split_m, D_node + D_ext + D_edge, K),
-            device=grad_out.device, dtype=grad_out.dtype,
-        )
-        weight_kernel = fused_edge_update_weight_backward_v3(
+        weight_kernel = fused_edge_update_weight_backward_v4(
             E=E, K=K, D_edge=D_edge, D_node=D_node, D_ext=D_ext,
             N_node=N_node, N_ext=N_ext, dtype=dtype, accum_dtype=dtype,
-            SPLIT_M=split_m,
         )
         weight_kernel(
             grad_out, n2e_index, n_ext2e_index,
-            node_ebd, node_ebd_ext, flat_edge_ebd, workspace,
+            node_ebd, node_ebd_ext, flat_edge_ebd,
+            grad_node_weight, grad_node_ext_weight, grad_edge_weight,
         )
-        weight_reduce_v2 = fused_edge_update_weight_backward_v2_reduce(
-            K=K, D_edge=D_edge, D_node=D_node, D_ext=D_ext,
-            SPLIT_M=split_m, accum_dtype=dtype,
-        )
-        weight_reduce_v2(
-            workspace, grad_node_weight, grad_node_ext_weight, grad_edge_weight,
-        )
+        # split_m = min(4, max(1, (E + 31) // 32))
+        # workspace = torch.empty(
+        #     (split_m, D_node + D_ext + D_edge, K),
+        #     device=grad_out.device, dtype=grad_out.dtype,
+        # )
+        # weight_kernel = fused_edge_update_weight_backward_v3(
+        #     E=E, K=K, D_edge=D_edge, D_node=D_node, D_ext=D_ext,
+        #     N_node=N_node, N_ext=N_ext, dtype=dtype, accum_dtype=dtype,
+        #     SPLIT_M=split_m,
+        # )
+        # weight_kernel(
+        #     grad_out, n2e_index, n_ext2e_index,
+        #     node_ebd, node_ebd_ext, flat_edge_ebd, workspace,
+        # )
+        # weight_reduce_v2 = fused_edge_update_weight_backward_v2_reduce(
+        #     K=K, D_edge=D_edge, D_node=D_node, D_ext=D_ext,
+        #     SPLIT_M=split_m, accum_dtype=dtype,
+        # )
+        # weight_reduce_v2(
+        #     workspace, grad_node_weight, grad_node_ext_weight, grad_edge_weight,
+        # )
 
         grad_edge_ebd = torch.empty(
             (E, D_edge),
