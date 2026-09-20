@@ -2966,7 +2966,7 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
         #     grad_node_ext_weight,
         # )
         dtype = str(grad_out.dtype).replace("torch.", "")
-        split_m = min(4, max(1, (E + 31) // 32))
+        split_m = min(30, max(1, (E + 31) // 32))
         workspace = torch.empty(
             (split_m, D_node + D_ext + D_edge, K),
             device=grad_out.device, dtype=grad_out.dtype,
@@ -3286,7 +3286,7 @@ class FusedEdgeUpdateFunctionBackward(torch.autograd.Function):
         #     grad_grad_edge_weight_input,
         # )
         # Split whole reduction tiles; keep the short edge reduction modest.
-        split_m = min(4, max(1, (E + 31) // 32))
+        split_m = min(33, max(1, (E + 31) // 32))
         workspace = torch.empty(
             (split_m, D_node + D_ext + D_edge, K),
             dtype=grad_out.dtype, device=grad_out.device,
