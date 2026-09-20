@@ -6313,3 +6313,1568 @@ class FusedAngleUpdateFunctionBackward(torch.autograd.Function):
             grad_sub_edge_ij,       # 10 sub_edge_ij
             None,                   # 11 node_ebd_shape
         )
+
+
+# ============================================================================
+# Wider RepFlow symmetrization block
+#
+# Keep this implementation append-only.  The original fused symmetrization,
+# edge-update, and angle-update kernels above are retained as independent
+# reference/fallback implementations.
+# ============================================================================
+
+
+@tilelang.jit
+def fused_sym_block_dual_hg_forward_uniform(
+    M, E_EDGE, E_NODE, N_NODE_EXT, NO, BLOCK_N=64,
+):
+    """Compute both HG tensors while gathering the node branch on demand."""
+    assert M % NO == 0
+    EDGES_PER_OWNER = M // NO
+    D = 3 * (E_EDGE + E_NODE)
+
+    @T.prim_func
+    def hg_forward_uniform(
+        edge_ebd: T.Tensor((M, E_EDGE), "float32"),
+        node_ebd_ext: T.Tensor((N_NODE_EXT, E_NODE), "float32"),
+        h2: T.Tensor((M, 3), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        n_ext2e_index: T.Tensor((M,), "int64"),
+        scale: T.float32,
+        h_edge: T.Tensor((NO, 3 * E_EDGE), "float32"),
+        h_node: T.Tensor((NO, 3 * E_NODE), "float32"),
+    ):
+        with T.Kernel(NO, T.ceildiv(D, BLOCK_N), threads=64) as (owner, tile):
+            meta = T.alloc_shared((EDGES_PER_OWNER, 4), "float32")
+            for r in T.Parallel(EDGES_PER_OWNER):
+                edge = owner * EDGES_PER_OWNER + r
+                meta[r, 0] = sw[edge]
+            for r, b in T.Parallel(EDGES_PER_OWNER, 3):
+                edge = owner * EDGES_PER_OWNER + r
+                meta[r, b + 1] = h2[edge, b]
+            T.sync_threads()
+
+            for j in T.Parallel(BLOCK_N):
+                col = tile * BLOCK_N + j
+                if col < D:
+                    acc = T.alloc_var("float32", init=0)
+                    if col < 3 * E_EDGE:
+                        b = col // E_EDGE
+                        d = col % E_EDGE
+                        for r in T.serial(EDGES_PER_OWNER):
+                            edge = owner * EDGES_PER_OWNER + r
+                            acc += edge_ebd[edge, d] * meta[r, 0] * meta[r, b + 1]
+                        h_edge[owner, col] = acc * scale
+                    else:
+                        local = col - 3 * E_EDGE
+                        b = local // E_NODE
+                        d = local % E_NODE
+                        for r in T.serial(EDGES_PER_OWNER):
+                            edge = owner * EDGES_PER_OWNER + r
+                            node = n_ext2e_index[edge]
+                            acc += node_ebd_ext[node, d] * meta[r, 0] * meta[r, b + 1]
+                        h_node[owner, local] = acc * scale
+
+    return hg_forward_uniform
+
+
+@tilelang.jit
+def fused_sym_block_dual_hg_forward_segmented(
+    M, E_EDGE, E_NODE, N_NODE_EXT, NO, BLOCK_N=64,
+):
+    """Segmented-owner variant of the dual HG kernel."""
+    D = 3 * (E_EDGE + E_NODE)
+
+    @T.prim_func
+    def hg_forward_segmented(
+        edge_ebd: T.Tensor((M, E_EDGE), "float32"),
+        node_ebd_ext: T.Tensor((N_NODE_EXT, E_NODE), "float32"),
+        h2: T.Tensor((M, 3), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        n_ext2e_index: T.Tensor((M,), "int64"),
+        offsets: T.Tensor((NO + 1,), "int64"),
+        order: T.Tensor((M,), "int64"),
+        scale: T.float32,
+        h_edge: T.Tensor((NO, 3 * E_EDGE), "float32"),
+        h_node: T.Tensor((NO, 3 * E_NODE), "float32"),
+    ):
+        with T.Kernel(NO, T.ceildiv(D, BLOCK_N), threads=64) as (owner, tile):
+            for j in T.Parallel(BLOCK_N):
+                col = tile * BLOCK_N + j
+                if col < D:
+                    acc = T.alloc_var("float32", init=0)
+                    if col < 3 * E_EDGE:
+                        b = col // E_EDGE
+                        d = col % E_EDGE
+                        for r in T.serial(offsets[owner], offsets[owner + 1]):
+                            edge = order[r]
+                            acc += edge_ebd[edge, d] * sw[edge] * h2[edge, b]
+                        h_edge[owner, col] = acc * scale
+                    else:
+                        local = col - 3 * E_EDGE
+                        b = local // E_NODE
+                        d = local % E_NODE
+                        for r in T.serial(offsets[owner], offsets[owner + 1]):
+                            edge = order[r]
+                            node = n_ext2e_index[edge]
+                            acc += node_ebd_ext[node, d] * sw[edge] * h2[edge, b]
+                        h_node[owner, local] = acc * scale
+
+    return hg_forward_segmented
+
+
+@tilelang.jit
+def fused_sym_block_dual_grrg_forward(NO, E_EDGE, E_NODE, A, BLOCK_N=128):
+    """Grouped Gram products; the two branches keep branch-local axes."""
+    DQ_EDGE = A * E_EDGE
+    DQ = A * (E_EDGE + E_NODE)
+
+    @T.prim_func
+    def grrg_forward(
+        h_edge: T.Tensor((NO, 3 * E_EDGE), "float32"),
+        h_node: T.Tensor((NO, 3 * E_NODE), "float32"),
+        q_edge: T.Tensor((NO, DQ_EDGE), "float32"),
+        q_node: T.Tensor((NO, A * E_NODE), "float32"),
+    ):
+        with T.Kernel(NO, T.ceildiv(DQ, BLOCK_N), threads=128) as (owner, tile):
+            for j in T.Parallel(BLOCK_N):
+                col = tile * BLOCK_N + j
+                if col < DQ:
+                    acc = T.alloc_var("float32", init=0)
+                    if col < DQ_EDGE:
+                        a = col // E_EDGE
+                        d = col % E_EDGE
+                        for b in T.serial(3):
+                            acc += h_edge[owner, b * E_EDGE + a] * h_edge[owner, b * E_EDGE + d]
+                        q_edge[owner, col] = acc / 3.0
+                    else:
+                        local = col - DQ_EDGE
+                        a = local // E_NODE
+                        d = local % E_NODE
+                        for b in T.serial(3):
+                            acc += h_node[owner, b * E_NODE + a] * h_node[owner, b * E_NODE + d]
+                        q_node[owner, local] = acc / 3.0
+
+    return grrg_forward
+
+
+@tilelang.jit
+def fused_sym_block_projection_act_residual_forward(
+    N, D_EDGE, D_NODE, C, BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
+):
+    """Logical-cat projection followed by custom-SiLU and residual update."""
+    D = D_EDGE + D_NODE
+
+    @T.prim_func
+    def projection_forward(
+        node_base: T.Tensor((N, C), "float32"),
+        q_edge: T.Tensor((N, D_EDGE), "float32"),
+        q_node: T.Tensor((N, D_NODE), "float32"),
+        weight: T.Tensor((D, C), "float32"),
+        bias: T.Tensor((C,), "float32"),
+        residual: T.Tensor((C,), "float32"),
+        threshold: T.float32,
+        slope: T.float32,
+        const_value: T.float32,
+        preact: T.Tensor((N, C), "float32"),
+        out: T.Tensor((N, C), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(N, BLOCK_M), T.ceildiv(C, BLOCK_N), threads=128) as (bx, by):
+            a_shared = T.alloc_shared((BLOCK_M, BLOCK_K), "float32")
+            b_shared = T.alloc_shared((BLOCK_K, BLOCK_N), "float32")
+            acc = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
+            T.clear(acc)
+            for ko in T.Pipelined(T.ceildiv(D, BLOCK_K), num_stages=2):
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    n = bx * BLOCK_M + mi
+                    d = ko * BLOCK_K + ki
+                    if n < N and d < D:
+                        if d < D_EDGE:
+                            a_shared[mi, ki] = q_edge[n, d]
+                        else:
+                            a_shared[mi, ki] = q_node[n, d - D_EDGE]
+                    else:
+                        a_shared[mi, ki] = 0
+                for ki, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                    d = ko * BLOCK_K + ki
+                    c = by * BLOCK_N + ni
+                    if d < D and c < C:
+                        b_shared[ki, ni] = weight[d, c]
+                    else:
+                        b_shared[ki, ni] = 0
+                T.sync_threads()
+                T.gemm(a_shared, b_shared, acc)
+                T.sync_threads()
+
+            for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                n = bx * BLOCK_M + mi
+                c = by * BLOCK_N + ni
+                if n < N and c < C:
+                    z = acc[mi, ni] + bias[c]
+                    value = T.alloc_var("float32")
+                    if z >= threshold:
+                        value = T.tanh(slope * (z - threshold)) + const_value
+                    else:
+                        sig = 1.0 / (1.0 + T.exp(-z))
+                        value = z * sig
+                    preact[n, c] = z
+                    out[n, c] = node_base[n, c] + residual[c] * value
+
+    return projection_forward
+
+
+@tilelang.jit
+def fused_sym_block_projection_backward_q(
+    N, D_EDGE, D_NODE, C, BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
+):
+    """Compute p @ W.T as one logical output-concatenated GEMM."""
+    D = D_EDGE + D_NODE
+
+    @T.prim_func
+    def backward_q(
+        grad_output: T.Tensor((N, C), "float32"),
+        preact: T.Tensor((N, C), "float32"),
+        weight: T.Tensor((D, C), "float32"),
+        residual: T.Tensor((C,), "float32"),
+        threshold: T.float32,
+        slope: T.float32,
+        grad_q_edge: T.Tensor((N, D_EDGE), "float32"),
+        grad_q_node: T.Tensor((N, D_NODE), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(N, BLOCK_M), T.ceildiv(D, BLOCK_N), threads=128) as (bx, by):
+            p_shared = T.alloc_shared((BLOCK_M, BLOCK_K), "float32")
+            w_shared = T.alloc_shared((BLOCK_N, BLOCK_K), "float32")
+            acc = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
+            T.clear(acc)
+            for ko in T.Pipelined(T.ceildiv(C, BLOCK_K), num_stages=2):
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    n = bx * BLOCK_M + mi
+                    c = ko * BLOCK_K + ki
+                    if n < N and c < C:
+                        z = preact[n, c]
+                        deriv = T.alloc_var("float32")
+                        if z >= threshold:
+                            th = T.tanh(slope * (z - threshold))
+                            deriv = slope * (1.0 - th * th)
+                        else:
+                            sig = 1.0 / (1.0 + T.exp(-z))
+                            deriv = sig * (1.0 + z * (1.0 - sig))
+                        p_shared[mi, ki] = grad_output[n, c] * residual[c] * deriv
+                    else:
+                        p_shared[mi, ki] = 0
+                for ni, ki in T.Parallel(BLOCK_N, BLOCK_K):
+                    d = by * BLOCK_N + ni
+                    c = ko * BLOCK_K + ki
+                    if d < D and c < C:
+                        w_shared[ni, ki] = weight[d, c]
+                    else:
+                        w_shared[ni, ki] = 0
+                T.sync_threads()
+                T.gemm(p_shared, w_shared, acc, transpose_B=True)
+                T.sync_threads()
+            for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                n = bx * BLOCK_M + mi
+                d = by * BLOCK_N + ni
+                if n < N and d < D:
+                    if d < D_EDGE:
+                        grad_q_edge[n, d] = acc[mi, ni]
+                    else:
+                        grad_q_node[n, d - D_EDGE] = acc[mi, ni]
+
+    return backward_q
+
+
+@tilelang.jit
+def fused_sym_block_projection_backward_weight(
+    N, D_EDGE, D_NODE, C, BLOCK_D=32, BLOCK_C=32, BLOCK_N=32,
+):
+    """Compute logical [Q_edge|Q_node].T @ p without a cat buffer."""
+    D = D_EDGE + D_NODE
+
+    @T.prim_func
+    def backward_weight(
+        grad_output: T.Tensor((N, C), "float32"),
+        preact: T.Tensor((N, C), "float32"),
+        q_edge: T.Tensor((N, D_EDGE), "float32"),
+        q_node: T.Tensor((N, D_NODE), "float32"),
+        residual: T.Tensor((C,), "float32"),
+        threshold: T.float32,
+        slope: T.float32,
+        grad_weight: T.Tensor((D, C), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(C, BLOCK_C), threads=128) as (bx, by):
+            q_shared = T.alloc_shared((BLOCK_N, BLOCK_D), "float32")
+            p_shared = T.alloc_shared((BLOCK_N, BLOCK_C), "float32")
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_C), "float32")
+            T.clear(acc)
+            for no in T.Pipelined(T.ceildiv(N, BLOCK_N), num_stages=2):
+                for ni, di in T.Parallel(BLOCK_N, BLOCK_D):
+                    n = no * BLOCK_N + ni
+                    d = bx * BLOCK_D + di
+                    if n < N and d < D:
+                        if d < D_EDGE:
+                            q_shared[ni, di] = q_edge[n, d]
+                        else:
+                            q_shared[ni, di] = q_node[n, d - D_EDGE]
+                    else:
+                        q_shared[ni, di] = 0
+                for ni, ci in T.Parallel(BLOCK_N, BLOCK_C):
+                    n = no * BLOCK_N + ni
+                    c = by * BLOCK_C + ci
+                    if n < N and c < C:
+                        z = preact[n, c]
+                        deriv = T.alloc_var("float32")
+                        if z >= threshold:
+                            th = T.tanh(slope * (z - threshold))
+                            deriv = slope * (1.0 - th * th)
+                        else:
+                            sig = 1.0 / (1.0 + T.exp(-z))
+                            deriv = sig * (1.0 + z * (1.0 - sig))
+                        p_shared[ni, ci] = grad_output[n, c] * residual[c] * deriv
+                    else:
+                        p_shared[ni, ci] = 0
+                T.sync_threads()
+                T.gemm(q_shared, p_shared, acc, transpose_A=True)
+                T.sync_threads()
+            for di, ci in T.Parallel(BLOCK_D, BLOCK_C):
+                d = bx * BLOCK_D + di
+                c = by * BLOCK_C + ci
+                if d < D and c < C:
+                    grad_weight[d, c] = acc[di, ci]
+
+    return backward_weight
+
+
+@tilelang.jit
+def fused_sym_block_projection_backward_vector(N, C, THREADS=128):
+    """Reduce projection bias and residual gradients per output channel."""
+
+    @T.prim_func
+    def backward_vector(
+        grad_output: T.Tensor((N, C), "float32"),
+        preact: T.Tensor((N, C), "float32"),
+        residual: T.Tensor((C,), "float32"),
+        threshold: T.float32,
+        slope: T.float32,
+        const_value: T.float32,
+        grad_bias: T.Tensor((C,), "float32"),
+        grad_residual: T.Tensor((C,), "float32"),
+    ):
+        with T.Kernel(C, threads=THREADS) as (c,):
+            tx = T.get_thread_binding()
+            partial_b = T.alloc_shared((THREADS,), "float32")
+            partial_r = T.alloc_shared((THREADS,), "float32")
+            acc_b = T.alloc_var("float32", init=0)
+            acc_r = T.alloc_var("float32", init=0)
+            for n in T.serial(tx, N, THREADS):
+                z = preact[n, c]
+                value = T.alloc_var("float32")
+                deriv = T.alloc_var("float32")
+                if z >= threshold:
+                    th = T.tanh(slope * (z - threshold))
+                    value = th + const_value
+                    deriv = slope * (1.0 - th * th)
+                else:
+                    sig = 1.0 / (1.0 + T.exp(-z))
+                    value = z * sig
+                    deriv = sig * (1.0 + z * (1.0 - sig))
+                g = grad_output[n, c]
+                acc_b += g * residual[c] * deriv
+                acc_r += g * value
+            partial_b[tx] = acc_b
+            partial_r[tx] = acc_r
+            T.sync_threads()
+            reduced_b = T.alloc_shared((1,), "float32")
+            reduced_r = T.alloc_shared((1,), "float32")
+            T.reduce_sum(partial_b, reduced_b, dim=0)
+            T.reduce_sum(partial_r, reduced_r, dim=0)
+            if tx == 0:
+                grad_bias[c] = reduced_b[0]
+                grad_residual[c] = reduced_r[0]
+
+    return backward_vector
+
+
+@tilelang.jit
+def fused_sym_block_dual_grrg_backward(NO, E_EDGE, E_NODE, A, BLOCK_D=128):
+    """Grouped Gram VJP; branch-local axis semantics are preserved."""
+    MAX_E = max(E_EDGE, E_NODE)
+
+    @T.prim_func
+    def grrg_backward(
+        grad_q_edge: T.Tensor((NO, A * E_EDGE), "float32"),
+        grad_q_node: T.Tensor((NO, A * E_NODE), "float32"),
+        h_edge: T.Tensor((NO, 3 * E_EDGE), "float32"),
+        h_node: T.Tensor((NO, 3 * E_NODE), "float32"),
+        scale: T.float32,
+        grad_h_edge: T.Tensor((NO, 3 * E_EDGE), "float32"),
+        grad_h_node: T.Tensor((NO, 3 * E_NODE), "float32"),
+    ):
+        with T.Kernel(NO, T.ceildiv(MAX_E, BLOCK_D), threads=128) as (owner, tile):
+            for b, j in T.Parallel(3, BLOCK_D):
+                d = tile * BLOCK_D + j
+                if d < E_EDGE:
+                    acc = T.alloc_var("float32", init=0)
+                    for a in T.serial(A):
+                        acc += h_edge[owner, b * E_EDGE + a] * grad_q_edge[owner, a * E_EDGE + d]
+                    if d < A:
+                        for k in T.serial(E_EDGE):
+                            acc += h_edge[owner, b * E_EDGE + k] * grad_q_edge[owner, d * E_EDGE + k]
+                    grad_h_edge[owner, b * E_EDGE + d] = acc * (scale / 3.0)
+                if d < E_NODE:
+                    acc = T.alloc_var("float32", init=0)
+                    for a in T.serial(A):
+                        acc += h_node[owner, b * E_NODE + a] * grad_q_node[owner, a * E_NODE + d]
+                    if d < A:
+                        for k in T.serial(E_NODE):
+                            acc += h_node[owner, b * E_NODE + k] * grad_q_node[owner, d * E_NODE + k]
+                    grad_h_node[owner, b * E_NODE + d] = acc * (scale / 3.0)
+
+    return grrg_backward
+
+
+@tilelang.jit
+def fused_sym_block_dual_hg_backward(
+    M, E_EDGE, E_NODE, N_NODE_EXT, NO, THREADS=128,
+):
+    """Dual HG VJP with direct edge writes and node-space scatter-adds."""
+
+    @T.prim_func
+    def hg_backward(
+        grad_h_edge: T.Tensor((NO, 3 * E_EDGE), "float32"),
+        grad_h_node: T.Tensor((NO, 3 * E_NODE), "float32"),
+        edge_ebd: T.Tensor((M, E_EDGE), "float32"),
+        node_ebd_ext: T.Tensor((N_NODE_EXT, E_NODE), "float32"),
+        h2: T.Tensor((M, 3), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        owner: T.Tensor((M,), "int64"),
+        n_ext2e_index: T.Tensor((M,), "int64"),
+        grad_flat_h_edge: T.Tensor((M, 3 * E_EDGE), "float32"),
+        grad_flat_h_node: T.Tensor((M, 3 * E_NODE), "float32"),
+        grad_edge_ebd: T.Tensor((M, E_EDGE), "float32"),
+        grad_node_ebd_ext: T.Tensor((N_NODE_EXT, E_NODE), "float32"),
+        grad_h2: T.Tensor((M, 3), "float32"),
+        grad_sw: T.Tensor((M,), "float32"),
+    ):
+        with T.Kernel(M, threads=THREADS) as (edge,):
+            tx = T.get_thread_binding()
+            o = owner[edge]
+            node = n_ext2e_index[edge]
+            w = sw[edge]
+            acc_h = T.alloc_fragment((3,), "float32")
+            acc_sw = T.alloc_var("float32", init=0)
+            T.clear(acc_h)
+
+            for d in T.serial(tx, E_EDGE, THREADS):
+                q = T.alloc_var("float32", init=0)
+                for b in T.serial(3):
+                    r = grad_h_edge[o, b * E_EDGE + d]
+                    grad_flat_h_edge[edge, b * E_EDGE + d] = r
+                    q += r * h2[edge, b]
+                    acc_h[b] += r * edge_ebd[edge, d]
+                grad_edge_ebd[edge, d] = q * w
+                acc_sw += q * edge_ebd[edge, d]
+
+            for d in T.serial(tx, E_NODE, THREADS):
+                q = T.alloc_var("float32", init=0)
+                value = node_ebd_ext[node, d]
+                for b in T.serial(3):
+                    r = grad_h_node[o, b * E_NODE + d]
+                    grad_flat_h_node[edge, b * E_NODE + d] = r
+                    q += r * h2[edge, b]
+                    acc_h[b] += r * value
+                T.atomic_add(grad_node_ebd_ext[node, d], q * w)
+                acc_sw += q * value
+
+            sh_h = T.alloc_shared((3, THREADS), "float32")
+            sh_sw = T.alloc_shared((THREADS,), "float32")
+            for b in T.Parallel(3):
+                sh_h[b, tx] = acc_h[b]
+            sh_sw[tx] = acc_sw
+            T.sync_threads()
+            red_h = T.alloc_shared((3,), "float32")
+            red_sw = T.alloc_shared((1,), "float32")
+            T.reduce_sum(sh_h, red_h, dim=1)
+            T.reduce_sum(sh_sw, red_sw, dim=0)
+            if tx == 0:
+                for b in T.serial(3):
+                    grad_h2[edge, b] = red_h[b] * w
+                grad_sw[edge] = red_sw[0]
+
+    return hg_backward
+
+
+@tilelang.jit
+def fused_sym_block_projection_double_ts_output(
+    N, D_EDGE, D_NODE, C,
+    HAS_BASE=True, HAS_Q_EDGE=True, HAS_Q_NODE=True,
+    HAS_WEIGHT=True, HAS_BIAS=True, HAS_RESIDUAL=True,
+    BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
+):
+    """Build t/s and grad-grad-output using a logical K=2D projection."""
+    D = D_EDGE + D_NODE
+
+    @T.prim_func
+    def double_backward_ts(
+        grad_output: T.Tensor((N, C), "float32"),
+        q_edge: T.Tensor((N, D_EDGE), "float32"),
+        q_node: T.Tensor((N, D_NODE), "float32"),
+        weight: T.Tensor((D, C), "float32"),
+        residual: T.Tensor((C,), "float32"),
+        preact: T.Tensor((N, C), "float32"),
+        u_base: T.Tensor((N, C), "float32"),
+        u_q_edge: T.Tensor((N, D_EDGE), "float32"),
+        u_q_node: T.Tensor((N, D_NODE), "float32"),
+        u_weight: T.Tensor((D, C), "float32"),
+        u_bias: T.Tensor((C,), "float32"),
+        u_residual: T.Tensor((C,), "float32"),
+        threshold: T.float32,
+        slope: T.float32,
+        const_value: T.float32,
+        p_out: T.Tensor((N, C), "float32"),
+        t_out: T.Tensor((N, C), "float32"),
+        s_out: T.Tensor((N, C), "float32"),
+        grad_grad_output: T.Tensor((N, C), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(N, BLOCK_M), T.ceildiv(C, BLOCK_N), threads=128) as (bx, by):
+            a_shared = T.alloc_shared((BLOCK_M, BLOCK_K), "float32")
+            b_shared = T.alloc_shared((BLOCK_K, BLOCK_N), "float32")
+            acc = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
+            T.clear(acc)
+
+            # [u_Q | Q] @ [W; u_W], with both concatenations kept logical.
+            if HAS_Q_EDGE or HAS_Q_NODE or HAS_WEIGHT:
+                for ko in T.Pipelined(T.ceildiv(2 * D, BLOCK_K), num_stages=2):
+                    for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                        n = bx * BLOCK_M + mi
+                        k = ko * BLOCK_K + ki
+                        if n < N and k < 2 * D:
+                            if k < D:
+                                if k < D_EDGE:
+                                    if HAS_Q_EDGE:
+                                        a_shared[mi, ki] = u_q_edge[n, k]
+                                    else:
+                                        a_shared[mi, ki] = 0
+                                else:
+                                    if HAS_Q_NODE:
+                                        a_shared[mi, ki] = u_q_node[n, k - D_EDGE]
+                                    else:
+                                        a_shared[mi, ki] = 0
+                            else:
+                                d = k - D
+                                if d < D_EDGE:
+                                    if HAS_WEIGHT:
+                                        a_shared[mi, ki] = q_edge[n, d]
+                                    else:
+                                        a_shared[mi, ki] = 0
+                                else:
+                                    if HAS_WEIGHT:
+                                        a_shared[mi, ki] = q_node[n, d - D_EDGE]
+                                    else:
+                                        a_shared[mi, ki] = 0
+                        else:
+                            a_shared[mi, ki] = 0
+                    for ki, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        k = ko * BLOCK_K + ki
+                        c = by * BLOCK_N + ni
+                        if k < 2 * D and c < C:
+                            if k < D:
+                                b_shared[ki, ni] = weight[k, c]
+                            else:
+                                if HAS_WEIGHT:
+                                    b_shared[ki, ni] = u_weight[k - D, c]
+                                else:
+                                    b_shared[ki, ni] = 0
+                        else:
+                            b_shared[ki, ni] = 0
+                    T.sync_threads()
+                    T.gemm(a_shared, b_shared, acc)
+                    T.sync_threads()
+
+            for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                n = bx * BLOCK_M + mi
+                c = by * BLOCK_N + ni
+                if n < N and c < C:
+                    z = preact[n, c]
+                    value = T.alloc_var("float32")
+                    deriv = T.alloc_var("float32")
+                    second = T.alloc_var("float32")
+                    if z >= threshold:
+                        th = T.tanh(slope * (z - threshold))
+                        value = th + const_value
+                        deriv = slope * (1.0 - th * th)
+                        second = -2.0 * slope * th * deriv
+                    else:
+                        sig = 1.0 / (1.0 + T.exp(-z))
+                        sigp = sig * (1.0 - sig)
+                        value = z * sig
+                        deriv = sig + z * sigp
+                        second = sigp * (2.0 + z * (1.0 - 2.0 * sig))
+                    t = acc[mi, ni]
+                    if HAS_BIAS:
+                        t += u_bias[c]
+                    g = grad_output[n, c]
+                    p = g * residual[c] * deriv
+                    s = t * g * residual[c] * second
+                    if HAS_RESIDUAL:
+                        s += u_residual[c] * g * deriv
+                    gg = t * residual[c] * deriv
+                    if HAS_RESIDUAL:
+                        gg += u_residual[c] * value
+                    if HAS_BASE:
+                        gg += u_base[n, c]
+                    p_out[n, c] = p
+                    t_out[n, c] = t
+                    s_out[n, c] = s
+                    grad_grad_output[n, c] = gg
+
+    return double_backward_ts
+
+
+@tilelang.jit
+def fused_sym_block_projection_double_q(
+    N, D_EDGE, D_NODE, C, HAS_WEIGHT=True,
+    BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
+):
+    """Compute [p|s] @ [u_W.T;W.T] as one logical K=2C GEMM."""
+    D = D_EDGE + D_NODE
+
+    @T.prim_func
+    def double_backward_q(
+        p: T.Tensor((N, C), "float32"),
+        s: T.Tensor((N, C), "float32"),
+        weight: T.Tensor((D, C), "float32"),
+        u_weight: T.Tensor((D, C), "float32"),
+        grad_q_edge: T.Tensor((N, D_EDGE), "float32"),
+        grad_q_node: T.Tensor((N, D_NODE), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(N, BLOCK_M), T.ceildiv(D, BLOCK_N), threads=128) as (bx, by):
+            lhs = T.alloc_shared((BLOCK_M, BLOCK_K), "float32")
+            rhs = T.alloc_shared((BLOCK_N, BLOCK_K), "float32")
+            acc = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
+            T.clear(acc)
+            for ko in T.Pipelined(T.ceildiv(2 * C, BLOCK_K), num_stages=2):
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    n = bx * BLOCK_M + mi
+                    k = ko * BLOCK_K + ki
+                    if n < N and k < 2 * C:
+                        if k < C:
+                            if HAS_WEIGHT:
+                                lhs[mi, ki] = p[n, k]
+                            else:
+                                lhs[mi, ki] = 0
+                        else:
+                            lhs[mi, ki] = s[n, k - C]
+                    else:
+                        lhs[mi, ki] = 0
+                for ni, ki in T.Parallel(BLOCK_N, BLOCK_K):
+                    d = by * BLOCK_N + ni
+                    k = ko * BLOCK_K + ki
+                    if d < D and k < 2 * C:
+                        if k < C:
+                            if HAS_WEIGHT:
+                                rhs[ni, ki] = u_weight[d, k]
+                            else:
+                                rhs[ni, ki] = 0
+                        else:
+                            rhs[ni, ki] = weight[d, k - C]
+                    else:
+                        rhs[ni, ki] = 0
+                T.sync_threads()
+                T.gemm(lhs, rhs, acc, transpose_B=True)
+                T.sync_threads()
+            for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                n = bx * BLOCK_M + mi
+                d = by * BLOCK_N + ni
+                if n < N and d < D:
+                    if d < D_EDGE:
+                        grad_q_edge[n, d] = acc[mi, ni]
+                    else:
+                        grad_q_node[n, d - D_EDGE] = acc[mi, ni]
+
+    return double_backward_q
+
+
+@tilelang.jit
+def fused_sym_block_projection_double_weight(
+    N, D_EDGE, D_NODE, C, HAS_Q_EDGE=True, HAS_Q_NODE=True,
+    BLOCK_D=32, BLOCK_C=32, BLOCK_N=32,
+):
+    """Compute [u_Q;Q].T @ [p;s] as a logical K=2N GEMM."""
+    D = D_EDGE + D_NODE
+
+    @T.prim_func
+    def double_backward_weight(
+        u_q_edge: T.Tensor((N, D_EDGE), "float32"),
+        u_q_node: T.Tensor((N, D_NODE), "float32"),
+        q_edge: T.Tensor((N, D_EDGE), "float32"),
+        q_node: T.Tensor((N, D_NODE), "float32"),
+        p: T.Tensor((N, C), "float32"),
+        s: T.Tensor((N, C), "float32"),
+        grad_weight: T.Tensor((D, C), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(C, BLOCK_C), threads=128) as (bx, by):
+            lhs = T.alloc_shared((BLOCK_N, BLOCK_D), "float32")
+            rhs = T.alloc_shared((BLOCK_N, BLOCK_C), "float32")
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_C), "float32")
+            T.clear(acc)
+            for ko in T.Pipelined(T.ceildiv(2 * N, BLOCK_N), num_stages=2):
+                for ni, di in T.Parallel(BLOCK_N, BLOCK_D):
+                    k = ko * BLOCK_N + ni
+                    d = bx * BLOCK_D + di
+                    if k < 2 * N and d < D:
+                        if k < N:
+                            if d < D_EDGE:
+                                if HAS_Q_EDGE:
+                                    lhs[ni, di] = u_q_edge[k, d]
+                                else:
+                                    lhs[ni, di] = 0
+                            else:
+                                if HAS_Q_NODE:
+                                    lhs[ni, di] = u_q_node[k, d - D_EDGE]
+                                else:
+                                    lhs[ni, di] = 0
+                        else:
+                            if d < D_EDGE:
+                                lhs[ni, di] = q_edge[k - N, d]
+                            else:
+                                lhs[ni, di] = q_node[k - N, d - D_EDGE]
+                    else:
+                        lhs[ni, di] = 0
+                for ni, ci in T.Parallel(BLOCK_N, BLOCK_C):
+                    k = ko * BLOCK_N + ni
+                    c = by * BLOCK_C + ci
+                    if k < 2 * N and c < C:
+                        if k < N:
+                            rhs[ni, ci] = p[k, c]
+                        else:
+                            rhs[ni, ci] = s[k - N, c]
+                    else:
+                        rhs[ni, ci] = 0
+                T.sync_threads()
+                T.gemm(lhs, rhs, acc, transpose_A=True)
+                T.sync_threads()
+            for di, ci in T.Parallel(BLOCK_D, BLOCK_C):
+                d = bx * BLOCK_D + di
+                c = by * BLOCK_C + ci
+                if d < D and c < C:
+                    grad_weight[d, c] = acc[di, ci]
+
+    return double_backward_weight
+
+
+@tilelang.jit
+def fused_sym_block_projection_double_vector(N, C, THREADS=128):
+    """Reduce second-order bias and residual gradients."""
+
+    @T.prim_func
+    def double_backward_vector(
+        grad_output: T.Tensor((N, C), "float32"),
+        preact: T.Tensor((N, C), "float32"),
+        t: T.Tensor((N, C), "float32"),
+        s: T.Tensor((N, C), "float32"),
+        threshold: T.float32,
+        slope: T.float32,
+        grad_bias: T.Tensor((C,), "float32"),
+        grad_residual: T.Tensor((C,), "float32"),
+    ):
+        with T.Kernel(C, threads=THREADS) as (c,):
+            tx = T.get_thread_binding()
+            sh_b = T.alloc_shared((THREADS,), "float32")
+            sh_r = T.alloc_shared((THREADS,), "float32")
+            acc_b = T.alloc_var("float32", init=0)
+            acc_r = T.alloc_var("float32", init=0)
+            for n in T.serial(tx, N, THREADS):
+                z = preact[n, c]
+                deriv = T.alloc_var("float32")
+                if z >= threshold:
+                    th = T.tanh(slope * (z - threshold))
+                    deriv = slope * (1.0 - th * th)
+                else:
+                    sig = 1.0 / (1.0 + T.exp(-z))
+                    deriv = sig * (1.0 + z * (1.0 - sig))
+                acc_b += s[n, c]
+                acc_r += t[n, c] * grad_output[n, c] * deriv
+            sh_b[tx] = acc_b
+            sh_r[tx] = acc_r
+            T.sync_threads()
+            red_b = T.alloc_shared((1,), "float32")
+            red_r = T.alloc_shared((1,), "float32")
+            T.reduce_sum(sh_b, red_b, dim=0)
+            T.reduce_sum(sh_r, red_r, dim=0)
+            if tx == 0:
+                grad_bias[c] = red_b[0]
+                grad_residual[c] = red_r[0]
+
+    return double_backward_vector
+
+
+@tilelang.jit
+def fused_sym_block_dual_double_owner_uniform(
+    M, E_EDGE, E_NODE, N_NODE_EXT, NO, A,
+    HAS_EDGE=True, HAS_NODE=True, HAS_H2=True, HAS_SW=True,
+    THREADS=128,
+):
+    """Dual-branch owner part of the geometry double backward."""
+    assert M % NO == 0
+    EDGES_PER_OWNER = M // NO
+    EDGE_ACTIVE = HAS_H2 or HAS_EDGE or HAS_SW
+    NODE_ACTIVE = HAS_H2 or HAS_NODE or HAS_SW
+
+    @T.prim_func
+    def double_backward_owner_uniform(
+        grad_q_edge: T.Tensor((NO, A * E_EDGE), "float32"),
+        grad_q_node: T.Tensor((NO, A * E_NODE), "float32"),
+        h_edge: T.Tensor((NO, 3 * E_EDGE), "float32"),
+        h_node: T.Tensor((NO, 3 * E_NODE), "float32"),
+        edge_ebd: T.Tensor((M, E_EDGE), "float32"),
+        node_ebd_ext: T.Tensor((N_NODE_EXT, E_NODE), "float32"),
+        h2: T.Tensor((M, 3), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        n_ext2e_index: T.Tensor((M,), "int64"),
+        u_edge: T.Tensor((M, E_EDGE), "float32"),
+        u_node: T.Tensor((N_NODE_EXT, E_NODE), "float32"),
+        u_h2: T.Tensor((M, 3), "float32"),
+        u_sw: T.Tensor((M,), "float32"),
+        scale: T.float32,
+        grad_grad_q_edge: T.Tensor((NO, A * E_EDGE), "float32"),
+        grad_grad_q_node: T.Tensor((NO, A * E_NODE), "float32"),
+        grad_h_edge: T.Tensor((NO, 3 * E_EDGE), "float32"),
+        grad_h_node: T.Tensor((NO, 3 * E_NODE), "float32"),
+    ):
+        with T.Kernel(NO, threads=THREADS) as (owner,):
+            q_edge = T.alloc_shared((3, E_EDGE), "float32")
+            q_node = T.alloc_shared((3, E_NODE), "float32")
+            for b, d in T.Parallel(3, E_EDGE):
+                acc = T.alloc_var("float32", init=0)
+                if EDGE_ACTIVE:
+                    for r in T.serial(EDGES_PER_OWNER):
+                        edge = owner * EDGES_PER_OWNER + r
+                        if HAS_H2:
+                            acc += u_h2[edge, b] * edge_ebd[edge, d] * sw[edge]
+                        if HAS_EDGE:
+                            acc += u_edge[edge, d] * h2[edge, b] * sw[edge]
+                        if HAS_SW:
+                            acc += u_sw[edge] * h2[edge, b] * edge_ebd[edge, d]
+                q_edge[b, d] = acc
+            for b, d in T.Parallel(3, E_NODE):
+                acc = T.alloc_var("float32", init=0)
+                if NODE_ACTIVE:
+                    for r in T.serial(EDGES_PER_OWNER):
+                        edge = owner * EDGES_PER_OWNER + r
+                        node = n_ext2e_index[edge]
+                        value = node_ebd_ext[node, d]
+                        if HAS_H2:
+                            acc += u_h2[edge, b] * value * sw[edge]
+                        if HAS_NODE:
+                            acc += u_node[node, d] * h2[edge, b] * sw[edge]
+                        if HAS_SW:
+                            acc += u_sw[edge] * h2[edge, b] * value
+                q_node[b, d] = acc
+            T.sync_threads()
+            c = scale / 3.0
+            for a, d in T.Parallel(A, E_EDGE):
+                acc = T.alloc_var("float32", init=0)
+                if EDGE_ACTIVE:
+                    for b in T.serial(3):
+                        acc += (
+                            h_edge[owner, b * E_EDGE + a] * q_edge[b, d]
+                            + q_edge[b, a] * h_edge[owner, b * E_EDGE + d]
+                        )
+                grad_grad_q_edge[owner, a * E_EDGE + d] = acc * c
+            for a, d in T.Parallel(A, E_NODE):
+                acc = T.alloc_var("float32", init=0)
+                if NODE_ACTIVE:
+                    for b in T.serial(3):
+                        acc += (
+                            h_node[owner, b * E_NODE + a] * q_node[b, d]
+                            + q_node[b, a] * h_node[owner, b * E_NODE + d]
+                        )
+                grad_grad_q_node[owner, a * E_NODE + d] = acc * c
+            for b, d in T.Parallel(3, E_EDGE):
+                acc = T.alloc_var("float32", init=0)
+                if EDGE_ACTIVE:
+                    for a in T.serial(A):
+                        acc += q_edge[b, a] * grad_q_edge[owner, a * E_EDGE + d]
+                    if d < A:
+                        for k in T.serial(E_EDGE):
+                            acc += q_edge[b, k] * grad_q_edge[owner, d * E_EDGE + k]
+                grad_h_edge[owner, b * E_EDGE + d] = acc * c
+            for b, d in T.Parallel(3, E_NODE):
+                acc = T.alloc_var("float32", init=0)
+                if NODE_ACTIVE:
+                    for a in T.serial(A):
+                        acc += q_node[b, a] * grad_q_node[owner, a * E_NODE + d]
+                    if d < A:
+                        for k in T.serial(E_NODE):
+                            acc += q_node[b, k] * grad_q_node[owner, d * E_NODE + k]
+                grad_h_node[owner, b * E_NODE + d] = acc * c
+
+    return double_backward_owner_uniform
+
+
+@tilelang.jit
+def fused_sym_block_dual_double_owner_segmented(
+    M, E_EDGE, E_NODE, N_NODE_EXT, NO, A,
+    HAS_EDGE=True, HAS_NODE=True, HAS_H2=True, HAS_SW=True,
+    THREADS=128,
+):
+    """Segmented-owner variant of the dual geometry double backward."""
+    EDGE_ACTIVE = HAS_H2 or HAS_EDGE or HAS_SW
+    NODE_ACTIVE = HAS_H2 or HAS_NODE or HAS_SW
+
+    @T.prim_func
+    def double_backward_owner_segmented(
+        grad_q_edge: T.Tensor((NO, A * E_EDGE), "float32"),
+        grad_q_node: T.Tensor((NO, A * E_NODE), "float32"),
+        h_edge: T.Tensor((NO, 3 * E_EDGE), "float32"),
+        h_node: T.Tensor((NO, 3 * E_NODE), "float32"),
+        edge_ebd: T.Tensor((M, E_EDGE), "float32"),
+        node_ebd_ext: T.Tensor((N_NODE_EXT, E_NODE), "float32"),
+        h2: T.Tensor((M, 3), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        n_ext2e_index: T.Tensor((M,), "int64"),
+        u_edge: T.Tensor((M, E_EDGE), "float32"),
+        u_node: T.Tensor((N_NODE_EXT, E_NODE), "float32"),
+        u_h2: T.Tensor((M, 3), "float32"),
+        u_sw: T.Tensor((M,), "float32"),
+        offsets: T.Tensor((NO + 1,), "int64"),
+        order: T.Tensor((M,), "int64"),
+        scale: T.float32,
+        grad_grad_q_edge: T.Tensor((NO, A * E_EDGE), "float32"),
+        grad_grad_q_node: T.Tensor((NO, A * E_NODE), "float32"),
+        grad_h_edge: T.Tensor((NO, 3 * E_EDGE), "float32"),
+        grad_h_node: T.Tensor((NO, 3 * E_NODE), "float32"),
+    ):
+        with T.Kernel(NO, threads=THREADS) as (owner,):
+            q_edge = T.alloc_shared((3, E_EDGE), "float32")
+            q_node = T.alloc_shared((3, E_NODE), "float32")
+            for b, d in T.Parallel(3, E_EDGE):
+                acc = T.alloc_var("float32", init=0)
+                if EDGE_ACTIVE:
+                    for r in T.serial(offsets[owner], offsets[owner + 1]):
+                        edge = order[r]
+                        if HAS_H2:
+                            acc += u_h2[edge, b] * edge_ebd[edge, d] * sw[edge]
+                        if HAS_EDGE:
+                            acc += u_edge[edge, d] * h2[edge, b] * sw[edge]
+                        if HAS_SW:
+                            acc += u_sw[edge] * h2[edge, b] * edge_ebd[edge, d]
+                q_edge[b, d] = acc
+            for b, d in T.Parallel(3, E_NODE):
+                acc = T.alloc_var("float32", init=0)
+                if NODE_ACTIVE:
+                    for r in T.serial(offsets[owner], offsets[owner + 1]):
+                        edge = order[r]
+                        node = n_ext2e_index[edge]
+                        value = node_ebd_ext[node, d]
+                        if HAS_H2:
+                            acc += u_h2[edge, b] * value * sw[edge]
+                        if HAS_NODE:
+                            acc += u_node[node, d] * h2[edge, b] * sw[edge]
+                        if HAS_SW:
+                            acc += u_sw[edge] * h2[edge, b] * value
+                q_node[b, d] = acc
+            T.sync_threads()
+            c = scale / 3.0
+            for a, d in T.Parallel(A, E_EDGE):
+                acc = T.alloc_var("float32", init=0)
+                if EDGE_ACTIVE:
+                    for b in T.serial(3):
+                        acc += (
+                            h_edge[owner, b * E_EDGE + a] * q_edge[b, d]
+                            + q_edge[b, a] * h_edge[owner, b * E_EDGE + d]
+                        )
+                grad_grad_q_edge[owner, a * E_EDGE + d] = acc * c
+            for a, d in T.Parallel(A, E_NODE):
+                acc = T.alloc_var("float32", init=0)
+                if NODE_ACTIVE:
+                    for b in T.serial(3):
+                        acc += (
+                            h_node[owner, b * E_NODE + a] * q_node[b, d]
+                            + q_node[b, a] * h_node[owner, b * E_NODE + d]
+                        )
+                grad_grad_q_node[owner, a * E_NODE + d] = acc * c
+            for b, d in T.Parallel(3, E_EDGE):
+                acc = T.alloc_var("float32", init=0)
+                if EDGE_ACTIVE:
+                    for a in T.serial(A):
+                        acc += q_edge[b, a] * grad_q_edge[owner, a * E_EDGE + d]
+                    if d < A:
+                        for k in T.serial(E_EDGE):
+                            acc += q_edge[b, k] * grad_q_edge[owner, d * E_EDGE + k]
+                grad_h_edge[owner, b * E_EDGE + d] = acc * c
+            for b, d in T.Parallel(3, E_NODE):
+                acc = T.alloc_var("float32", init=0)
+                if NODE_ACTIVE:
+                    for a in T.serial(A):
+                        acc += q_node[b, a] * grad_q_node[owner, a * E_NODE + d]
+                    if d < A:
+                        for k in T.serial(E_NODE):
+                            acc += q_node[b, k] * grad_q_node[owner, d * E_NODE + k]
+                grad_h_node[owner, b * E_NODE + d] = acc * c
+
+    return double_backward_owner_segmented
+
+
+@tilelang.jit
+def fused_sym_block_dual_double_edge(
+    M, E_EDGE, E_NODE, N_NODE_EXT, NO,
+    HAS_EDGE=True, HAS_NODE=True, HAS_H2=True, HAS_SW=True,
+    THREADS=128,
+):
+    """Edge part of the dual geometry double backward."""
+    EDGE_ACTIVE = HAS_H2 or HAS_EDGE or HAS_SW
+    NODE_ACTIVE = HAS_H2 or HAS_NODE or HAS_SW
+
+    @T.prim_func
+    def double_backward_edge(
+        flat_r_edge: T.Tensor((M, 3 * E_EDGE), "float32"),
+        flat_r_node: T.Tensor((M, 3 * E_NODE), "float32"),
+        grad_h_edge: T.Tensor((NO, 3 * E_EDGE), "float32"),
+        grad_h_node: T.Tensor((NO, 3 * E_NODE), "float32"),
+        edge_ebd: T.Tensor((M, E_EDGE), "float32"),
+        node_ebd_ext: T.Tensor((N_NODE_EXT, E_NODE), "float32"),
+        h2: T.Tensor((M, 3), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        owner: T.Tensor((M,), "int64"),
+        n_ext2e_index: T.Tensor((M,), "int64"),
+        u_edge: T.Tensor((M, E_EDGE), "float32"),
+        u_node: T.Tensor((N_NODE_EXT, E_NODE), "float32"),
+        u_h2: T.Tensor((M, 3), "float32"),
+        u_sw: T.Tensor((M,), "float32"),
+        scale: T.float32,
+        grad_edge_ebd: T.Tensor((M, E_EDGE), "float32"),
+        grad_node_ebd_ext: T.Tensor((N_NODE_EXT, E_NODE), "float32"),
+        grad_h2_out: T.Tensor((M, 3), "float32"),
+        grad_sw_out: T.Tensor((M,), "float32"),
+    ):
+        with T.Kernel(M, threads=THREADS) as (edge,):
+            tx = T.get_thread_binding()
+            o = owner[edge]
+            node = n_ext2e_index[edge]
+            w = sw[edge]
+            acc_h = T.alloc_fragment((3,), "float32")
+            acc_sw = T.alloc_var("float32", init=0)
+            T.clear(acc_h)
+
+            for d in T.serial(tx, E_EDGE, THREADS):
+                out_value = T.alloc_var("float32", init=0)
+                if EDGE_ACTIVE:
+                    edge_value = edge_ebd[edge, d]
+                    for b in T.serial(3):
+                        r = flat_r_edge[edge, b * E_EDGE + d]
+                        gh = grad_h_edge[o, b * E_EDGE + d] * scale
+                        if HAS_H2:
+                            out_value += u_h2[edge, b] * r * w
+                            acc_sw += u_h2[edge, b] * edge_value * r
+                        if HAS_EDGE:
+                            acc_h[b] += u_edge[edge, d] * w * r
+                            acc_sw += u_edge[edge, d] * h2[edge, b] * r
+                        if HAS_SW:
+                            out_value += u_sw[edge] * r * h2[edge, b]
+                            acc_h[b] += u_sw[edge] * edge_value * r
+                        out_value += gh * h2[edge, b] * w
+                        acc_h[b] += gh * edge_value * w
+                        acc_sw += gh * h2[edge, b] * edge_value
+                grad_edge_ebd[edge, d] = out_value
+
+            for d in T.serial(tx, E_NODE, THREADS):
+                if NODE_ACTIVE:
+                    node_value = node_ebd_ext[node, d]
+                    out_value = T.alloc_var("float32", init=0)
+                    for b in T.serial(3):
+                        r = flat_r_node[edge, b * E_NODE + d]
+                        gh = grad_h_node[o, b * E_NODE + d] * scale
+                        if HAS_H2:
+                            out_value += u_h2[edge, b] * r * w
+                            acc_sw += u_h2[edge, b] * node_value * r
+                        if HAS_NODE:
+                            acc_h[b] += u_node[node, d] * w * r
+                            acc_sw += u_node[node, d] * h2[edge, b] * r
+                        if HAS_SW:
+                            out_value += u_sw[edge] * r * h2[edge, b]
+                            acc_h[b] += u_sw[edge] * node_value * r
+                        out_value += gh * h2[edge, b] * w
+                        acc_h[b] += gh * node_value * w
+                        acc_sw += gh * h2[edge, b] * node_value
+                    T.atomic_add(grad_node_ebd_ext[node, d], out_value)
+
+            sh_h = T.alloc_shared((3, THREADS), "float32")
+            sh_sw = T.alloc_shared((THREADS,), "float32")
+            for b in T.Parallel(3):
+                sh_h[b, tx] = acc_h[b]
+            sh_sw[tx] = acc_sw
+            T.sync_threads()
+            red_h = T.alloc_shared((3,), "float32")
+            red_sw = T.alloc_shared((1,), "float32")
+            T.reduce_sum(sh_h, red_h, dim=1)
+            T.reduce_sum(sh_sw, red_sw, dim=0)
+            if tx == 0:
+                for b in T.serial(3):
+                    grad_h2_out[edge, b] = red_h[b]
+                grad_sw_out[edge] = red_sw[0]
+
+    return double_backward_edge
+
+
+class FusedDualSymGeometryFunction(torch.autograd.Function):
+    """Online node gather plus the two materialized grouped Gram products."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        edge_ebd,
+        node_ebd_ext,
+        h2,
+        sw,
+        owner,
+        n_ext2e_index,
+        num_owner,
+        scale_factor,
+        axis_neuron,
+    ):
+        edge_ebd = edge_ebd.contiguous()
+        node_ebd_ext = node_ebd_ext.contiguous()
+        h2 = h2.contiguous()
+        sw = sw.contiguous()
+        owner = owner.long().contiguous()
+        n_ext2e_index = n_ext2e_index.long().contiguous()
+        M, e_edge = edge_ebd.shape
+        n_node_ext, e_node = node_ebd_ext.shape
+        h_edge = torch.empty(
+            (num_owner, 3 * e_edge), device=edge_ebd.device, dtype=edge_ebd.dtype
+        )
+        h_node = torch.empty(
+            (num_owner, 3 * e_node), device=edge_ebd.device, dtype=edge_ebd.dtype
+        )
+        metadata = _sym_owner_metadata(owner, num_owner)
+        uniform, offsets, order = metadata
+        if M == 0:
+            h_edge.zero_()
+            h_node.zero_()
+        elif uniform:
+            hg_forward_kernel = fused_sym_block_dual_hg_forward_uniform(
+                M=M, E_EDGE=e_edge, E_NODE=e_node,
+                N_NODE_EXT=n_node_ext, NO=num_owner,
+            )
+            hg_forward_kernel(
+                edge_ebd, node_ebd_ext, h2, sw, n_ext2e_index,
+                float(scale_factor), h_edge, h_node,
+            )
+        else:
+            hg_forward_kernel = fused_sym_block_dual_hg_forward_segmented(
+                M=M, E_EDGE=e_edge, E_NODE=e_node,
+                N_NODE_EXT=n_node_ext, NO=num_owner,
+            )
+            hg_forward_kernel(
+                edge_ebd, node_ebd_ext, h2, sw, n_ext2e_index,
+                offsets, order, float(scale_factor), h_edge, h_node,
+            )
+
+        q_edge = torch.empty(
+            (num_owner, axis_neuron * e_edge),
+            device=edge_ebd.device, dtype=edge_ebd.dtype,
+        )
+        q_node = torch.empty(
+            (num_owner, axis_neuron * e_node),
+            device=edge_ebd.device, dtype=edge_ebd.dtype,
+        )
+        grrg_kernel = fused_sym_block_dual_grrg_forward(
+            NO=num_owner, E_EDGE=e_edge, E_NODE=e_node, A=axis_neuron,
+        )
+        grrg_kernel(h_edge, h_node, q_edge, q_node)
+
+        ctx.owner_metadata = metadata
+        ctx.num_owner = num_owner
+        ctx.scale_factor = scale_factor
+        ctx.axis_neuron = axis_neuron
+        ctx.save_for_backward(
+            edge_ebd, node_ebd_ext, h2, sw, owner, n_ext2e_index,
+            h_edge, h_node,
+        )
+        return q_edge, q_node
+
+    @staticmethod
+    def backward(ctx, grad_q_edge, grad_q_node):
+        (
+            edge_ebd, node_ebd_ext, h2, sw, owner, n_ext2e_index,
+            h_edge, h_node,
+        ) = ctx.saved_tensors
+        grad_edge, grad_node, grad_h2, grad_sw = (
+            FusedDualSymGeometryFunctionBackward.apply(
+                grad_q_edge, grad_q_node,
+                edge_ebd, node_ebd_ext, h2, sw,
+                owner, n_ext2e_index, h_edge, h_node,
+                ctx.num_owner, ctx.scale_factor, ctx.axis_neuron,
+                ctx.owner_metadata,
+            )
+        )
+        return (
+            grad_edge, grad_node, grad_h2, grad_sw,
+            None, None, None, None, None,
+        )
+
+
+class FusedDualSymGeometryFunctionBackward(torch.autograd.Function):
+    """First derivative of the wider geometry block, with fused double backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        grad_q_edge,
+        grad_q_node,
+        edge_ebd,
+        node_ebd_ext,
+        h2,
+        sw,
+        owner,
+        n_ext2e_index,
+        h_edge,
+        h_node,
+        num_owner,
+        scale_factor,
+        axis_neuron,
+        owner_metadata,
+    ):
+        grad_q_edge = grad_q_edge.contiguous()
+        grad_q_node = grad_q_node.contiguous()
+        M, e_edge = edge_ebd.shape
+        n_node_ext, e_node = node_ebd_ext.shape
+        grad_h_edge = torch.empty_like(h_edge)
+        grad_h_node = torch.empty_like(h_node)
+        grrg_backward = fused_sym_block_dual_grrg_backward(
+            NO=num_owner, E_EDGE=e_edge, E_NODE=e_node, A=axis_neuron,
+        )
+        grrg_backward(
+            grad_q_edge, grad_q_node, h_edge, h_node,
+            float(scale_factor), grad_h_edge, grad_h_node,
+        )
+
+        grad_flat_h_edge = torch.empty(
+            (M, 3 * e_edge), device=edge_ebd.device, dtype=edge_ebd.dtype,
+        )
+        grad_flat_h_node = torch.empty(
+            (M, 3 * e_node), device=edge_ebd.device, dtype=edge_ebd.dtype,
+        )
+        grad_edge = torch.empty_like(edge_ebd)
+        grad_node = torch.zeros_like(node_ebd_ext)
+        grad_h2 = torch.empty_like(h2)
+        grad_sw = torch.empty_like(sw)
+        if M:
+            hg_backward = fused_sym_block_dual_hg_backward(
+                M=M, E_EDGE=e_edge, E_NODE=e_node,
+                N_NODE_EXT=n_node_ext, NO=num_owner,
+            )
+            hg_backward(
+                grad_h_edge, grad_h_node,
+                edge_ebd, node_ebd_ext, h2, sw,
+                owner, n_ext2e_index,
+                grad_flat_h_edge, grad_flat_h_node,
+                grad_edge, grad_node, grad_h2, grad_sw,
+            )
+        else:
+            grad_edge.zero_()
+            grad_h2.zero_()
+            grad_sw.zero_()
+
+        ctx.set_materialize_grads(False)
+        ctx.owner_metadata = owner_metadata
+        ctx.num_owner = num_owner
+        ctx.scale_factor = scale_factor
+        ctx.axis_neuron = axis_neuron
+        ctx.save_for_backward(
+            grad_q_edge, grad_q_node,
+            edge_ebd, node_ebd_ext, h2, sw,
+            owner, n_ext2e_index, h_edge, h_node,
+            grad_flat_h_edge, grad_flat_h_node,
+        )
+        return grad_edge, grad_node, grad_h2, grad_sw
+
+    @staticmethod
+    def backward(ctx, u_edge, u_node, u_h2, u_sw):
+        (
+            grad_q_edge, grad_q_node,
+            edge_ebd, node_ebd_ext, h2, sw,
+            owner, n_ext2e_index, h_edge, h_node,
+            flat_r_edge, flat_r_node,
+        ) = ctx.saved_tensors
+        M, e_edge = edge_ebd.shape
+        n_node_ext, e_node = node_ebd_ext.shape
+        num_owner = ctx.num_owner
+        if M == 0:
+            return (
+                torch.zeros_like(grad_q_edge), torch.zeros_like(grad_q_node),
+                torch.zeros_like(edge_ebd), torch.zeros_like(node_ebd_ext),
+                torch.zeros_like(h2), torch.zeros_like(sw),
+                None, None, None, None, None, None, None, None,
+            )
+        has_edge = u_edge is not None
+        has_node = u_node is not None
+        has_h2 = u_h2 is not None
+        has_sw = u_sw is not None
+        u_edge = None if u_edge is None else u_edge.contiguous()
+        u_node = None if u_node is None else u_node.contiguous()
+        u_h2 = None if u_h2 is None else u_h2.contiguous()
+        u_sw = None if u_sw is None else u_sw.contiguous()
+
+        gg_q_edge = torch.empty_like(grad_q_edge)
+        gg_q_node = torch.empty_like(grad_q_node)
+        grad_h_edge = torch.empty_like(h_edge)
+        grad_h_node = torch.empty_like(h_node)
+        uniform, offsets, order = ctx.owner_metadata
+        factory = (
+            fused_sym_block_dual_double_owner_uniform
+            if uniform else fused_sym_block_dual_double_owner_segmented
+        )
+        owner_kernel = factory(
+            M=M, E_EDGE=e_edge, E_NODE=e_node,
+            N_NODE_EXT=n_node_ext, NO=num_owner, A=ctx.axis_neuron,
+            HAS_EDGE=has_edge, HAS_NODE=has_node,
+            HAS_H2=has_h2, HAS_SW=has_sw,
+        )
+        metadata_args = () if uniform else (offsets, order)
+        owner_kernel(
+            grad_q_edge, grad_q_node, h_edge, h_node,
+            edge_ebd, node_ebd_ext, h2, sw, n_ext2e_index,
+            u_edge if has_edge else edge_ebd,
+            u_node if has_node else node_ebd_ext,
+            u_h2 if has_h2 else h2,
+            u_sw if has_sw else sw,
+            *metadata_args, float(ctx.scale_factor),
+            gg_q_edge, gg_q_node, grad_h_edge, grad_h_node,
+        )
+
+        grad_edge = torch.empty_like(edge_ebd)
+        grad_node = torch.zeros_like(node_ebd_ext)
+        grad_h2_out = torch.empty_like(h2)
+        grad_sw_out = torch.empty_like(sw)
+        edge_kernel = fused_sym_block_dual_double_edge(
+            M=M, E_EDGE=e_edge, E_NODE=e_node,
+            N_NODE_EXT=n_node_ext, NO=num_owner,
+            HAS_EDGE=has_edge, HAS_NODE=has_node,
+            HAS_H2=has_h2, HAS_SW=has_sw,
+        )
+        edge_kernel(
+            flat_r_edge, flat_r_node, grad_h_edge, grad_h_node,
+            edge_ebd, node_ebd_ext, h2, sw, owner, n_ext2e_index,
+            u_edge if has_edge else edge_ebd,
+            u_node if has_node else node_ebd_ext,
+            u_h2 if has_h2 else h2,
+            u_sw if has_sw else sw,
+            float(ctx.scale_factor),
+            grad_edge, grad_node, grad_h2_out, grad_sw_out,
+        )
+        return (
+            gg_q_edge, gg_q_node,
+            grad_edge, grad_node, grad_h2_out, grad_sw_out,
+            None, None, None, None, None, None, None, None,
+        )
+
+
+class FusedSymProjectionActResidualFunction(torch.autograd.Function):
+    """No-cat projection, custom-SiLU, and trainable residual accumulation."""
+
+    @staticmethod
+    def forward(
+        ctx, node_base, q_edge, q_node, weight, bias, residual,
+        threshold, slope, const_value,
+    ):
+        node_base = node_base.contiguous()
+        q_edge = q_edge.contiguous()
+        q_node = q_node.contiguous()
+        weight = weight.contiguous()
+        bias = bias.contiguous()
+        residual = residual.contiguous()
+        N, C = node_base.shape
+        d_edge = q_edge.shape[1]
+        d_node = q_node.shape[1]
+        preact = torch.empty_like(node_base)
+        out = torch.empty_like(node_base)
+        projection_forward_kernel = fused_sym_block_projection_act_residual_forward(
+            N=N, D_EDGE=d_edge, D_NODE=d_node, C=C,
+        )
+        projection_forward_kernel(
+            node_base, q_edge, q_node, weight, bias, residual,
+            float(threshold), float(slope), float(const_value), preact, out,
+        )
+        ctx.threshold = threshold
+        ctx.slope = slope
+        ctx.const_value = const_value
+        ctx.save_for_backward(q_edge, q_node, weight, bias, residual, preact)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        q_edge, q_node, weight, bias, residual, preact = ctx.saved_tensors
+        outputs = FusedSymProjectionActResidualFunctionBackward.apply(
+            grad_output, q_edge, q_node, weight, bias, residual, preact,
+            ctx.threshold, ctx.slope, ctx.const_value,
+        )
+        return (*outputs, None, None, None)
+
+
+class FusedSymProjectionActResidualFunctionBackward(torch.autograd.Function):
+    """First derivative of the no-cat projection, including double backward."""
+
+    @staticmethod
+    def forward(
+        ctx, grad_output, q_edge, q_node, weight, bias, residual, preact,
+        threshold, slope, const_value,
+    ):
+        grad_output = grad_output.contiguous()
+        N, C = grad_output.shape
+        d_edge = q_edge.shape[1]
+        d_node = q_node.shape[1]
+        grad_q_edge = torch.empty_like(q_edge)
+        grad_q_node = torch.empty_like(q_node)
+        q_kernel = fused_sym_block_projection_backward_q(
+            N=N, D_EDGE=d_edge, D_NODE=d_node, C=C,
+        )
+        q_kernel(
+            grad_output, preact, weight, residual,
+            float(threshold), float(slope), grad_q_edge, grad_q_node,
+        )
+        grad_weight = torch.empty_like(weight)
+        w_kernel = fused_sym_block_projection_backward_weight(
+            N=N, D_EDGE=d_edge, D_NODE=d_node, C=C,
+        )
+        w_kernel(
+            grad_output, preact, q_edge, q_node, residual,
+            float(threshold), float(slope), grad_weight,
+        )
+        grad_bias = torch.empty_like(bias)
+        grad_residual = torch.empty_like(residual)
+        v_kernel = fused_sym_block_projection_backward_vector(N=N, C=C)
+        v_kernel(
+            grad_output, preact, residual,
+            float(threshold), float(slope), float(const_value),
+            grad_bias, grad_residual,
+        )
+        ctx.set_materialize_grads(False)
+        ctx.threshold = threshold
+        ctx.slope = slope
+        ctx.const_value = const_value
+        ctx.save_for_backward(
+            grad_output, q_edge, q_node, weight, bias, residual, preact,
+        )
+        grad_node_base = grad_output
+        return (
+            grad_node_base, grad_q_edge, grad_q_node,
+            grad_weight, grad_bias, grad_residual,
+        )
+
+    @staticmethod
+    def backward(
+        ctx, u_base, u_q_edge, u_q_node, u_weight, u_bias, u_residual,
+    ):
+        grad_output, q_edge, q_node, weight, bias, residual, preact = ctx.saved_tensors
+        N, C = grad_output.shape
+        d_edge = q_edge.shape[1]
+        d_node = q_node.shape[1]
+        has_base = u_base is not None
+        has_q_edge = u_q_edge is not None
+        has_q_node = u_q_node is not None
+        has_weight = u_weight is not None
+        has_bias = u_bias is not None
+        has_residual = u_residual is not None
+        u_base = None if u_base is None else u_base.contiguous()
+        u_q_edge = None if u_q_edge is None else u_q_edge.contiguous()
+        u_q_node = None if u_q_node is None else u_q_node.contiguous()
+        u_weight = None if u_weight is None else u_weight.contiguous()
+        u_bias = None if u_bias is None else u_bias.contiguous()
+        u_residual = None if u_residual is None else u_residual.contiguous()
+
+        p = torch.empty_like(grad_output)
+        t = torch.empty_like(grad_output)
+        s = torch.empty_like(grad_output)
+        grad_grad_output = torch.empty_like(grad_output)
+        ts_kernel = fused_sym_block_projection_double_ts_output(
+            N=N, D_EDGE=d_edge, D_NODE=d_node, C=C,
+            HAS_BASE=has_base, HAS_Q_EDGE=has_q_edge, HAS_Q_NODE=has_q_node,
+            HAS_WEIGHT=has_weight, HAS_BIAS=has_bias,
+            HAS_RESIDUAL=has_residual,
+        )
+        ts_kernel(
+            grad_output, q_edge, q_node, weight, residual, preact,
+            u_base if has_base else grad_output,
+            u_q_edge if has_q_edge else q_edge,
+            u_q_node if has_q_node else q_node,
+            u_weight if has_weight else weight,
+            u_bias if has_bias else bias,
+            u_residual if has_residual else residual,
+            float(ctx.threshold), float(ctx.slope), float(ctx.const_value),
+            p, t, s, grad_grad_output,
+        )
+
+        grad_q_edge = torch.empty_like(q_edge)
+        grad_q_node = torch.empty_like(q_node)
+        q_kernel = fused_sym_block_projection_double_q(
+            N=N, D_EDGE=d_edge, D_NODE=d_node, C=C,
+            HAS_WEIGHT=has_weight,
+        )
+        q_kernel(
+            p, s, weight, u_weight if has_weight else weight,
+            grad_q_edge, grad_q_node,
+        )
+
+        grad_weight = torch.empty_like(weight)
+        w_kernel = fused_sym_block_projection_double_weight(
+            N=N, D_EDGE=d_edge, D_NODE=d_node, C=C,
+            HAS_Q_EDGE=has_q_edge, HAS_Q_NODE=has_q_node,
+        )
+        w_kernel(
+            u_q_edge if has_q_edge else q_edge,
+            u_q_node if has_q_node else q_node,
+            q_edge, q_node, p, s, grad_weight,
+        )
+
+        grad_bias = torch.empty_like(bias)
+        grad_residual = torch.empty_like(residual)
+        v_kernel = fused_sym_block_projection_double_vector(N=N, C=C)
+        v_kernel(
+            grad_output, preact, t, s,
+            float(ctx.threshold), float(ctx.slope),
+            grad_bias, grad_residual,
+        )
+        return (
+            grad_grad_output, grad_q_edge, grad_q_node,
+            grad_weight, grad_bias, grad_residual,
+            None, None, None, None,
+        )
+
+
+def fused_sym_block_dynamic(
+    node_base,
+    edge_ebd,
+    node_ebd_ext,
+    h2,
+    sw,
+    owner,
+    n_ext2e_index,
+    projection_weight,
+    projection_bias,
+    residual,
+    num_owner,
+    nb,
+    nloc,
+    scale_factor,
+    axis_neuron,
+    threshold,
+    slope,
+    const_value,
+):
+    """Compose the two new twice-differentiable Sym sub-operators."""
+    node_shape = node_base.shape
+    node_base_flat = node_base.reshape(num_owner, node_shape[-1])
+    node_ext_flat = node_ebd_ext.reshape(-1, node_ebd_ext.shape[-1])
+    q_edge, q_node = FusedDualSymGeometryFunction.apply(
+        edge_ebd, node_ext_flat, h2, sw, owner, n_ext2e_index,
+        num_owner, scale_factor, axis_neuron,
+    )
+    out = FusedSymProjectionActResidualFunction.apply(
+        node_base_flat, q_edge, q_node,
+        projection_weight, projection_bias, residual,
+        threshold, slope, const_value,
+    )
+    return out.reshape(nb, nloc, node_shape[-1])

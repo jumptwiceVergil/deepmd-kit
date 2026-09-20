@@ -36,7 +36,12 @@ from deepmd.utils.version import (
 
 from torch.utils.cpp_extension import load
 
-from .utils_tilelang import FusedSymmetrizationOpDynamic, FusedEdgeUpdateFunction, FusedAngleUpdateFunction
+from .utils_tilelang import (
+    FusedAngleUpdateFunction,
+    FusedEdgeUpdateFunction,
+    FusedSymmetrizationOpDynamic,
+    fused_sym_block_dynamic as _fused_sym_block_dynamic,
+)
 
 class RepFlowLayer(torch.nn.Module):
     def __init__(
@@ -543,6 +548,49 @@ class RepFlowLayer(torch.nn.Module):
         axis_neuron: int,
     ) -> torch.Tensor:
         return FusedSymmetrizationOpDynamic.apply(flat_edge_ebd, flat_h2, flat_sw, owner, num_owner, nb, nloc, scale_factor, axis_neuron)
+
+    def fused_sym_block_dynamic(
+        self,
+        node_base: torch.Tensor,
+        flat_edge_ebd: torch.Tensor,
+        node_ebd_ext: torch.Tensor,
+        flat_h2: torch.Tensor,
+        flat_sw: torch.Tensor,
+        owner: torch.Tensor,
+        n_ext2e_index: torch.Tensor,
+        num_owner: int,
+        nb: int,
+        nloc: int,
+        scale_factor: float,
+        axis_neuron: int,
+    ) -> torch.Tensor:
+        """Wider dynamic Sym block used only by :meth:`forward_fused`."""
+        assert self.node_sym_linear.bias is not None
+        assert self.act.silut is not None
+        silut = self.act.silut
+        const_value = (
+            silut.const_val if hasattr(silut, "const_val") else silut.const
+        )
+        return _fused_sym_block_dynamic(
+            node_base,
+            flat_edge_ebd,
+            node_ebd_ext,
+            flat_h2,
+            flat_sw,
+            owner,
+            n_ext2e_index,
+            self.node_sym_linear.matrix,
+            self.node_sym_linear.bias,
+            self.n_residual[1],
+            num_owner,
+            nb,
+            nloc,
+            scale_factor,
+            axis_neuron,
+            silut.threshold,
+            silut.slope,
+            const_value,
+        )
 
     def optim_angle_update(
         self,
@@ -1731,6 +1779,159 @@ class RepFlowLayer(torch.nn.Module):
         # update angle_ebd
         a_updated = self.list_update(a_update_list, "angle")
         torch.cuda.nvtx.range_pop()
+        return n_updated, e_updated, a_updated
+
+    def forward_fused(
+        self,
+        node_ebd_ext: torch.Tensor,
+        edge_ebd: torch.Tensor,
+        h2: torch.Tensor,
+        angle_ebd: torch.Tensor,
+        nlist: torch.Tensor,
+        nlist_mask: torch.Tensor,
+        sw: torch.Tensor,
+        a_nlist: torch.Tensor,
+        a_nlist_mask: torch.Tensor,
+        a_sw: torch.Tensor,
+        edge_index: torch.Tensor,
+        angle_index: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run the branch-specialized forward path used by the 64x finetune job.
+
+        This path is equivalent to :meth:`forward` for the configuration used by
+        ``input_finetune_64x.json``: dynamic neighbor selection, optimized
+        updates, one edge-message head, angular updates, split-based angular
+        compression, smooth edge updates, and residual-style list updates.
+        """
+        nb, nloc, _ = nlist.shape
+        node_ebd = node_ebd_ext[:, :nloc, :]
+        assert (nb, nloc) == node_ebd.shape[:2]
+        n_edge = h2.shape[0]
+        del a_nlist
+
+        n2e_index, n_ext2e_index = edge_index[0], edge_index[1]
+        n2a_index, eij2a_index, eik2a_index = (
+            angle_index[0],
+            angle_index[1],
+            angle_index[2],
+        )
+
+        e_update_list: list[torch.Tensor] = [edge_ebd]
+        a_update_list: list[torch.Tensor] = [angle_ebd]
+
+        with torch.cuda.nvtx.range("node self update"):
+            node_self_mlp = self.act(self.node_self_mlp(node_ebd))
+            node_base = node_ebd + self.n_residual[0] * node_self_mlp
+
+        torch.cuda.nvtx.range_push("geometry symmetrization")
+        node_partial = self.fused_sym_block_dynamic(
+            node_base,
+            edge_ebd,
+            node_ebd_ext,
+            h2,
+            sw,
+            owner=n2e_index,
+            n_ext2e_index=n_ext2e_index,
+            num_owner=nb * nloc,
+            nb=nb,
+            nloc=nloc,
+            scale_factor=self.dynamic_e_sel ** (-0.5),
+            axis_neuron=self.axis_neuron,
+        )
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push("G1 message pass")
+        node_edge_update = self.act(
+            self.fused_optim_edge_update_dynamic(
+                node_ebd,
+                node_ebd_ext,
+                edge_ebd,
+                n2e_index,
+                n_ext2e_index,
+                "node",
+            )
+        ) * sw.unsqueeze(-1)
+        node_edge_update = (
+            aggregate(
+                node_edge_update,
+                n2e_index,
+                average=False,
+                num_owner=nb * nloc,
+            ).reshape(nb, nloc, node_edge_update.shape[-1])
+            / self.dynamic_e_sel
+        )
+        torch.cuda.nvtx.range_pop()
+
+        with torch.cuda.nvtx.range("node update"):
+            n_updated = node_partial + self.n_residual[2] * node_edge_update
+
+        torch.cuda.nvtx.range_push("atom to bond")
+        edge_self_update = self.act(
+            self.fused_optim_edge_update_dynamic(
+                node_ebd,
+                node_ebd_ext,
+                edge_ebd,
+                n2e_index,
+                n_ext2e_index,
+                "edge",
+            )
+        )
+        e_update_list.append(edge_self_update)
+        torch.cuda.nvtx.range_pop()
+
+        assert self.angle_self_linear is not None
+        assert self.edge_angle_linear1 is not None
+        assert self.edge_angle_linear2 is not None
+
+        node_ebd_for_angle = node_ebd[..., : self.n_a_compress_dim]
+        edge_ebd_for_angle = edge_ebd[..., : self.e_a_compress_dim]
+        torch.cuda.nvtx.range_push("G2 message pass")
+        edge_angle_update = self.act(
+            self.fused_optim_angle_update_dynamic(
+                angle_ebd,
+                node_ebd_for_angle,
+                edge_ebd_for_angle,
+                n2a_index,
+                eij2a_index,
+                eik2a_index,
+                "edge",
+            )
+        )
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push("edge update")
+        weighted_edge_angle_update = edge_angle_update * a_sw.unsqueeze(-1)
+        padding_edge_angle_update = aggregate(
+            weighted_edge_angle_update,
+            eij2a_index,
+            average=False,
+            num_owner=n_edge,
+        ) / (self.dynamic_a_sel**0.5)
+        e_update_list.append(
+            self.act(self.edge_angle_linear2(padding_edge_angle_update))
+        )
+        e_updated = e_update_list[0]
+        e_updated = e_updated + self.e_residual[0] * e_update_list[1]
+        e_updated = e_updated + self.e_residual[1] * e_update_list[2]
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push("angle update")
+        angle_self_update = self.act(
+            self.fused_optim_angle_update_dynamic(
+                angle_ebd,
+                node_ebd_for_angle,
+                edge_ebd_for_angle,
+                n2a_index,
+                eij2a_index,
+                eik2a_index,
+                "angle",
+            )
+        )
+        a_update_list.append(angle_self_update)
+        a_updated = a_update_list[0]
+        a_updated = a_updated + self.a_residual[0] * a_update_list[1]
+        torch.cuda.nvtx.range_pop()
+
         return n_updated, e_updated, a_updated
 
     @torch.jit.export

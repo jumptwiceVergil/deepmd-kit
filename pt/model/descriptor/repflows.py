@@ -644,7 +644,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                         node_ebd_real_ext, node_ebd_virtual_ext, real_nloc
                     )
             with torch.cuda.nvtx.range("message pass"):        
-                node_ebd, edge_ebd, angle_ebd = ll.forward(
+                node_ebd, edge_ebd, angle_ebd = ll.forward_fused(
                     node_ebd_ext,
                     edge_ebd,
                     h2,
