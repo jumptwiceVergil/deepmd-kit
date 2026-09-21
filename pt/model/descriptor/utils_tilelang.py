@@ -6761,35 +6761,58 @@ def fused_sym_block_dual_hg_backward(
             o = owner[edge]
             node = n_ext2e_index[edge]
             w = sw[edge]
-            acc_h = T.alloc_fragment((3,), "float32")
+            # A three-element fragment with a dynamic ``b`` index is not a
+            # reliable thread-local scalar array in current TileLang lowering:
+            # it left some lanes of grad_h2 effectively uninitialized.  Keep
+            # the three fixed Cartesian components in explicit registers.
+            acc_h0 = T.alloc_var("float32", init=0)
+            acc_h1 = T.alloc_var("float32", init=0)
+            acc_h2 = T.alloc_var("float32", init=0)
             acc_sw = T.alloc_var("float32", init=0)
-            T.clear(acc_h)
 
             for d in T.serial(tx, E_EDGE, THREADS):
-                q = T.alloc_var("float32", init=0)
-                for b in T.serial(3):
-                    r = grad_h_edge[o, b * E_EDGE + d]
-                    grad_flat_h_edge[edge, b * E_EDGE + d] = r
-                    q += r * h2[edge, b]
-                    acc_h[b] += r * edge_ebd[edge, d]
-                grad_edge_ebd[edge, d] = q * w
-                acc_sw += q * edge_ebd[edge, d]
+                edge_r0 = grad_h_edge[o, d]
+                edge_r1 = grad_h_edge[o, E_EDGE + d]
+                edge_r2 = grad_h_edge[o, 2 * E_EDGE + d]
+                grad_flat_h_edge[edge, d] = edge_r0
+                grad_flat_h_edge[edge, E_EDGE + d] = edge_r1
+                grad_flat_h_edge[edge, 2 * E_EDGE + d] = edge_r2
+                edge_q = (
+                    edge_r0 * h2[edge, 0]
+                    + edge_r1 * h2[edge, 1]
+                    + edge_r2 * h2[edge, 2]
+                )
+                edge_value = edge_ebd[edge, d]
+                acc_h0 += edge_r0 * edge_value
+                acc_h1 += edge_r1 * edge_value
+                acc_h2 += edge_r2 * edge_value
+                grad_edge_ebd[edge, d] = edge_q * w
+                acc_sw += edge_q * edge_value
 
             for d in T.serial(tx, E_NODE, THREADS):
-                q = T.alloc_var("float32", init=0)
-                value = node_ebd_ext[node, d]
-                for b in T.serial(3):
-                    r = grad_h_node[o, b * E_NODE + d]
-                    grad_flat_h_node[edge, b * E_NODE + d] = r
-                    q += r * h2[edge, b]
-                    acc_h[b] += r * value
-                T.atomic_add(grad_node_ebd_ext[node, d], q * w)
-                acc_sw += q * value
+                node_r0 = grad_h_node[o, d]
+                node_r1 = grad_h_node[o, E_NODE + d]
+                node_r2 = grad_h_node[o, 2 * E_NODE + d]
+                grad_flat_h_node[edge, d] = node_r0
+                grad_flat_h_node[edge, E_NODE + d] = node_r1
+                grad_flat_h_node[edge, 2 * E_NODE + d] = node_r2
+                node_q = (
+                    node_r0 * h2[edge, 0]
+                    + node_r1 * h2[edge, 1]
+                    + node_r2 * h2[edge, 2]
+                )
+                node_value = node_ebd_ext[node, d]
+                acc_h0 += node_r0 * node_value
+                acc_h1 += node_r1 * node_value
+                acc_h2 += node_r2 * node_value
+                T.atomic_add(grad_node_ebd_ext[node, d], node_q * w)
+                acc_sw += node_q * node_value
 
             sh_h = T.alloc_shared((3, THREADS), "float32")
             sh_sw = T.alloc_shared((THREADS,), "float32")
-            for b in T.Parallel(3):
-                sh_h[b, tx] = acc_h[b]
+            sh_h[0, tx] = acc_h0
+            sh_h[1, tx] = acc_h1
+            sh_h[2, tx] = acc_h2
             sh_sw[tx] = acc_sw
             T.sync_threads()
             red_h = T.alloc_shared((3,), "float32")
@@ -7358,56 +7381,122 @@ def fused_sym_block_dual_double_edge(
             o = owner[edge]
             node = n_ext2e_index[edge]
             w = sw[edge]
-            acc_h = T.alloc_fragment((3,), "float32")
+            acc_h0 = T.alloc_var("float32", init=0)
+            acc_h1 = T.alloc_var("float32", init=0)
+            acc_h2 = T.alloc_var("float32", init=0)
             acc_sw = T.alloc_var("float32", init=0)
-            T.clear(acc_h)
 
             for d in T.serial(tx, E_EDGE, THREADS):
-                out_value = T.alloc_var("float32", init=0)
+                edge_out = T.alloc_var("float32", init=0)
                 if EDGE_ACTIVE:
                     edge_value = edge_ebd[edge, d]
-                    for b in T.serial(3):
-                        r = flat_r_edge[edge, b * E_EDGE + d]
-                        gh = grad_h_edge[o, b * E_EDGE + d] * scale
-                        if HAS_H2:
-                            out_value += u_h2[edge, b] * r * w
-                            acc_sw += u_h2[edge, b] * edge_value * r
-                        if HAS_EDGE:
-                            acc_h[b] += u_edge[edge, d] * w * r
-                            acc_sw += u_edge[edge, d] * h2[edge, b] * r
-                        if HAS_SW:
-                            out_value += u_sw[edge] * r * h2[edge, b]
-                            acc_h[b] += u_sw[edge] * edge_value * r
-                        out_value += gh * h2[edge, b] * w
-                        acc_h[b] += gh * edge_value * w
-                        acc_sw += gh * h2[edge, b] * edge_value
-                grad_edge_ebd[edge, d] = out_value
+                    edge_r0 = flat_r_edge[edge, d]
+                    edge_r1 = flat_r_edge[edge, E_EDGE + d]
+                    edge_r2 = flat_r_edge[edge, 2 * E_EDGE + d]
+                    edge_gh0 = grad_h_edge[o, d] * scale
+                    edge_gh1 = grad_h_edge[o, E_EDGE + d] * scale
+                    edge_gh2 = grad_h_edge[o, 2 * E_EDGE + d] * scale
+                    if HAS_H2:
+                        edge_out += w * (
+                            u_h2[edge, 0] * edge_r0
+                            + u_h2[edge, 1] * edge_r1
+                            + u_h2[edge, 2] * edge_r2
+                        )
+                        acc_sw += edge_value * (
+                            u_h2[edge, 0] * edge_r0
+                            + u_h2[edge, 1] * edge_r1
+                            + u_h2[edge, 2] * edge_r2
+                        )
+                    if HAS_EDGE:
+                        edge_u = u_edge[edge, d]
+                        acc_h0 += edge_u * w * edge_r0
+                        acc_h1 += edge_u * w * edge_r1
+                        acc_h2 += edge_u * w * edge_r2
+                        acc_sw += edge_u * (
+                            h2[edge, 0] * edge_r0
+                            + h2[edge, 1] * edge_r1
+                            + h2[edge, 2] * edge_r2
+                        )
+                    if HAS_SW:
+                        edge_usw = u_sw[edge]
+                        edge_out += edge_usw * (
+                            edge_r0 * h2[edge, 0]
+                            + edge_r1 * h2[edge, 1]
+                            + edge_r2 * h2[edge, 2]
+                        )
+                        acc_h0 += edge_usw * edge_value * edge_r0
+                        acc_h1 += edge_usw * edge_value * edge_r1
+                        acc_h2 += edge_usw * edge_value * edge_r2
+                    edge_gh_dot_h = (
+                        edge_gh0 * h2[edge, 0]
+                        + edge_gh1 * h2[edge, 1]
+                        + edge_gh2 * h2[edge, 2]
+                    )
+                    edge_out += edge_gh_dot_h * w
+                    acc_h0 += edge_gh0 * edge_value * w
+                    acc_h1 += edge_gh1 * edge_value * w
+                    acc_h2 += edge_gh2 * edge_value * w
+                    acc_sw += edge_gh_dot_h * edge_value
+                grad_edge_ebd[edge, d] = edge_out
 
             for d in T.serial(tx, E_NODE, THREADS):
                 if NODE_ACTIVE:
                     node_value = node_ebd_ext[node, d]
-                    out_value = T.alloc_var("float32", init=0)
-                    for b in T.serial(3):
-                        r = flat_r_node[edge, b * E_NODE + d]
-                        gh = grad_h_node[o, b * E_NODE + d] * scale
-                        if HAS_H2:
-                            out_value += u_h2[edge, b] * r * w
-                            acc_sw += u_h2[edge, b] * node_value * r
-                        if HAS_NODE:
-                            acc_h[b] += u_node[node, d] * w * r
-                            acc_sw += u_node[node, d] * h2[edge, b] * r
-                        if HAS_SW:
-                            out_value += u_sw[edge] * r * h2[edge, b]
-                            acc_h[b] += u_sw[edge] * node_value * r
-                        out_value += gh * h2[edge, b] * w
-                        acc_h[b] += gh * node_value * w
-                        acc_sw += gh * h2[edge, b] * node_value
-                    T.atomic_add(grad_node_ebd_ext[node, d], out_value)
+                    node_out = T.alloc_var("float32", init=0)
+                    node_r0 = flat_r_node[edge, d]
+                    node_r1 = flat_r_node[edge, E_NODE + d]
+                    node_r2 = flat_r_node[edge, 2 * E_NODE + d]
+                    node_gh0 = grad_h_node[o, d] * scale
+                    node_gh1 = grad_h_node[o, E_NODE + d] * scale
+                    node_gh2 = grad_h_node[o, 2 * E_NODE + d] * scale
+                    if HAS_H2:
+                        node_out += w * (
+                            u_h2[edge, 0] * node_r0
+                            + u_h2[edge, 1] * node_r1
+                            + u_h2[edge, 2] * node_r2
+                        )
+                        acc_sw += node_value * (
+                            u_h2[edge, 0] * node_r0
+                            + u_h2[edge, 1] * node_r1
+                            + u_h2[edge, 2] * node_r2
+                        )
+                    if HAS_NODE:
+                        node_u = u_node[node, d]
+                        acc_h0 += node_u * w * node_r0
+                        acc_h1 += node_u * w * node_r1
+                        acc_h2 += node_u * w * node_r2
+                        acc_sw += node_u * (
+                            h2[edge, 0] * node_r0
+                            + h2[edge, 1] * node_r1
+                            + h2[edge, 2] * node_r2
+                        )
+                    if HAS_SW:
+                        node_usw = u_sw[edge]
+                        node_out += node_usw * (
+                            node_r0 * h2[edge, 0]
+                            + node_r1 * h2[edge, 1]
+                            + node_r2 * h2[edge, 2]
+                        )
+                        acc_h0 += node_usw * node_value * node_r0
+                        acc_h1 += node_usw * node_value * node_r1
+                        acc_h2 += node_usw * node_value * node_r2
+                    node_gh_dot_h = (
+                        node_gh0 * h2[edge, 0]
+                        + node_gh1 * h2[edge, 1]
+                        + node_gh2 * h2[edge, 2]
+                    )
+                    node_out += node_gh_dot_h * w
+                    acc_h0 += node_gh0 * node_value * w
+                    acc_h1 += node_gh1 * node_value * w
+                    acc_h2 += node_gh2 * node_value * w
+                    acc_sw += node_gh_dot_h * node_value
+                    T.atomic_add(grad_node_ebd_ext[node, d], node_out)
 
             sh_h = T.alloc_shared((3, THREADS), "float32")
             sh_sw = T.alloc_shared((THREADS,), "float32")
-            for b in T.Parallel(3):
-                sh_h[b, tx] = acc_h[b]
+            sh_h[0, tx] = acc_h0
+            sh_h[1, tx] = acc_h1
+            sh_h[2, tx] = acc_h2
             sh_sw[tx] = acc_sw
             T.sync_threads()
             red_h = T.alloc_shared((3,), "float32")
