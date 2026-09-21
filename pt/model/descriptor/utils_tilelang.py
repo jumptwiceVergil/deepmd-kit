@@ -8515,6 +8515,11 @@ def fused_edge_block_double_prepare(
                 edge = bx * BLOCK_M + mi
                 c = by * BLOCK_N + ni
                 if edge < M and c < C:
+                    t = T.alloc_var("float32")
+                    z = T.alloc_var("float32")
+                    p = T.alloc_var("float32")
+                    s = T.alloc_var("float32")
+                    gg = T.alloc_var("float32")
                     if c < C_NODE:
                         t = acc[mi, ni]
                         if HAS_U_NODE_BIAS:
