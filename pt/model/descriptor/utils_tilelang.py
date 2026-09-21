@@ -7433,6 +7433,7 @@ class FusedDualSymGeometryFunction(torch.autograd.Function):
         num_owner,
         scale_factor,
         axis_neuron,
+        owner_metadata,
     ):
         edge_ebd = edge_ebd.contiguous()
         node_ebd_ext = node_ebd_ext.contiguous()
@@ -7448,7 +7449,7 @@ class FusedDualSymGeometryFunction(torch.autograd.Function):
         h_node = torch.empty(
             (num_owner, 3 * e_node), device=edge_ebd.device, dtype=edge_ebd.dtype
         )
-        metadata = _sym_owner_metadata(owner, num_owner)
+        metadata = owner_metadata
         uniform, offsets, order = metadata
         if M == 0:
             h_edge.zero_()
@@ -7512,7 +7513,7 @@ class FusedDualSymGeometryFunction(torch.autograd.Function):
         )
         return (
             grad_edge, grad_node, grad_h2, grad_sw,
-            None, None, None, None, None,
+            None, None, None, None, None, None,
         )
 
 
@@ -7863,6 +7864,7 @@ def fused_sym_block_dynamic(
     threshold,
     slope,
     const_value,
+    owner_metadata,
 ):
     """Compose the two new twice-differentiable Sym sub-operators."""
     node_shape = node_base.shape
@@ -7870,7 +7872,7 @@ def fused_sym_block_dynamic(
     node_ext_flat = node_ebd_ext.reshape(-1, node_ebd_ext.shape[-1])
     q_edge, q_node = FusedDualSymGeometryFunction.apply(
         edge_ebd, node_ext_flat, h2, sw, owner, n_ext2e_index,
-        num_owner, scale_factor, axis_neuron,
+        num_owner, scale_factor, axis_neuron, owner_metadata,
     )
     out = FusedSymProjectionActResidualFunction.apply(
         node_base_flat, q_edge, q_node,
@@ -7878,3 +7880,1704 @@ def fused_sym_block_dynamic(
         threshold, slope, const_value,
     )
     return out.reshape(nb, nloc, node_shape[-1])
+
+
+# ============================================================================
+# Wider RepFlow edge block
+#
+# The two projections share the same logical input
+# [central_node | neighbour_node | edge].  They are evaluated as one logical
+# output-concatenated GEMM.  The owner metadata is supplied by forward_fused
+# and is shared with the wider Sym block.
+# ============================================================================
+
+
+@tilelang.jit
+def fused_edge_block_projection_forward(
+    M, N_NODE, N_NODE_EXT, C_NODE, C_EDGE,
+    BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
+):
+    D = 2 * C_NODE + C_EDGE
+    C = C_NODE + C_EDGE
+
+    @T.prim_func
+    def edge_projection_forward(
+        node_ebd: T.Tensor((N_NODE, C_NODE), "float32"),
+        node_ebd_ext: T.Tensor((N_NODE_EXT, C_NODE), "float32"),
+        edge_ebd: T.Tensor((M, C_EDGE), "float32"),
+        owner: T.Tensor((M,), "int64"),
+        n_ext2e_index: T.Tensor((M,), "int64"),
+        node_weight: T.Tensor((D, C_NODE), "float32"),
+        node_bias: T.Tensor((C_NODE,), "float32"),
+        edge_weight: T.Tensor((D, C_EDGE), "float32"),
+        edge_bias: T.Tensor((C_EDGE,), "float32"),
+        edge_residual: T.Tensor((C_EDGE,), "float32"),
+        threshold: T.float32,
+        slope: T.float32,
+        const_value: T.float32,
+        node_preact: T.Tensor((M, C_NODE), "float32"),
+        edge_preact: T.Tensor((M, C_EDGE), "float32"),
+        edge_partial: T.Tensor((M, C_EDGE), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(M, BLOCK_M), T.ceildiv(C, BLOCK_N), threads=128) as (bx, by):
+            lhs = T.alloc_shared((BLOCK_M, BLOCK_K), "float32")
+            rhs = T.alloc_shared((BLOCK_K, BLOCK_N), "float32")
+            acc = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
+            T.clear(acc)
+            for ko in T.Pipelined(T.ceildiv(D, BLOCK_K), num_stages=2):
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    edge = bx * BLOCK_M + mi
+                    d = ko * BLOCK_K + ki
+                    if edge < M and d < D:
+                        if d < C_NODE:
+                            lhs[mi, ki] = node_ebd[owner[edge], d]
+                        elif d < 2 * C_NODE:
+                            lhs[mi, ki] = node_ebd_ext[n_ext2e_index[edge], d - C_NODE]
+                        else:
+                            lhs[mi, ki] = edge_ebd[edge, d - 2 * C_NODE]
+                    else:
+                        lhs[mi, ki] = 0
+                for ki, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                    d = ko * BLOCK_K + ki
+                    c = by * BLOCK_N + ni
+                    if d < D and c < C:
+                        if c < C_NODE:
+                            rhs[ki, ni] = node_weight[d, c]
+                        else:
+                            rhs[ki, ni] = edge_weight[d, c - C_NODE]
+                    else:
+                        rhs[ki, ni] = 0
+                T.sync_threads()
+                T.gemm(lhs, rhs, acc)
+                T.sync_threads()
+            for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                edge = bx * BLOCK_M + mi
+                c = by * BLOCK_N + ni
+                if edge < M and c < C:
+                    if c < C_NODE:
+                        node_preact[edge, c] = acc[mi, ni] + node_bias[c]
+                    else:
+                        ce = c - C_NODE
+                        z = acc[mi, ni] + edge_bias[ce]
+                        value = T.alloc_var("float32")
+                        if z >= threshold:
+                            value = T.tanh(slope * (z - threshold)) + const_value
+                        else:
+                            sig = 1.0 / (1.0 + T.exp(-z))
+                            value = z * sig
+                        edge_preact[edge, ce] = z
+                        edge_partial[edge, ce] = edge_ebd[edge, ce] + edge_residual[ce] * value
+
+    return edge_projection_forward
+
+
+@tilelang.jit
+def fused_edge_block_node_reduce_forward_uniform(
+    M, NO, C_NODE, THREADS=128,
+):
+    assert M % NO == 0
+    EDGES_PER_OWNER = M // NO
+
+    @T.prim_func
+    def edge_node_reduce_forward_uniform(
+        node_partial: T.Tensor((NO, C_NODE), "float32"),
+        node_preact: T.Tensor((M, C_NODE), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        node_residual: T.Tensor((C_NODE,), "float32"),
+        scale: T.float32,
+        threshold: T.float32,
+        slope: T.float32,
+        const_value: T.float32,
+        node_output: T.Tensor((NO, C_NODE), "float32"),
+    ):
+        with T.Kernel(NO, T.ceildiv(C_NODE, THREADS), threads=THREADS) as (owner_id, tile):
+            tx = T.get_thread_binding()
+            c = tile * THREADS + tx
+            if c < C_NODE:
+                acc = T.alloc_var("float32", init=0)
+                for r in T.serial(EDGES_PER_OWNER):
+                    edge = owner_id * EDGES_PER_OWNER + r
+                    z = node_preact[edge, c]
+                    value = T.alloc_var("float32")
+                    if z >= threshold:
+                        value = T.tanh(slope * (z - threshold)) + const_value
+                    else:
+                        sig = 1.0 / (1.0 + T.exp(-z))
+                        value = z * sig
+                    acc += sw[edge] * value
+                node_output[owner_id, c] = node_partial[owner_id, c] + node_residual[c] * scale * acc
+
+    return edge_node_reduce_forward_uniform
+
+
+@tilelang.jit
+def fused_edge_block_node_reduce_forward_segmented(
+    M, NO, C_NODE, THREADS=128,
+):
+    @T.prim_func
+    def edge_node_reduce_forward_segmented(
+        node_partial: T.Tensor((NO, C_NODE), "float32"),
+        node_preact: T.Tensor((M, C_NODE), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        node_residual: T.Tensor((C_NODE,), "float32"),
+        offsets: T.Tensor((NO + 1,), "int64"),
+        order: T.Tensor((M,), "int64"),
+        scale: T.float32,
+        threshold: T.float32,
+        slope: T.float32,
+        const_value: T.float32,
+        node_output: T.Tensor((NO, C_NODE), "float32"),
+    ):
+        with T.Kernel(NO, T.ceildiv(C_NODE, THREADS), threads=THREADS) as (owner_id, tile):
+            tx = T.get_thread_binding()
+            c = tile * THREADS + tx
+            if c < C_NODE:
+                acc = T.alloc_var("float32", init=0)
+                for r in T.serial(offsets[owner_id], offsets[owner_id + 1]):
+                    edge = order[r]
+                    z = node_preact[edge, c]
+                    value = T.alloc_var("float32")
+                    if z >= threshold:
+                        value = T.tanh(slope * (z - threshold)) + const_value
+                    else:
+                        sig = 1.0 / (1.0 + T.exp(-z))
+                        value = z * sig
+                    acc += sw[edge] * value
+                node_output[owner_id, c] = node_partial[owner_id, c] + node_residual[c] * scale * acc
+
+    return edge_node_reduce_forward_segmented
+
+
+@tilelang.jit
+def fused_edge_block_backward_inputs(
+    M, N_NODE, N_NODE_EXT, C_NODE, C_EDGE,
+    HAS_GRAD_NODE=True, HAS_GRAD_EDGE=True,
+    BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
+):
+    D = 2 * C_NODE + C_EDGE
+    C = C_NODE + C_EDGE
+
+    @T.prim_func
+    def edge_backward_inputs(
+        grad_node_output: T.Tensor((N_NODE, C_NODE), "float32"),
+        grad_edge_output: T.Tensor((M, C_EDGE), "float32"),
+        node_preact: T.Tensor((M, C_NODE), "float32"),
+        edge_preact: T.Tensor((M, C_EDGE), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        owner: T.Tensor((M,), "int64"),
+        n_ext2e_index: T.Tensor((M,), "int64"),
+        node_weight: T.Tensor((D, C_NODE), "float32"),
+        node_residual: T.Tensor((C_NODE,), "float32"),
+        edge_weight: T.Tensor((D, C_EDGE), "float32"),
+        edge_residual: T.Tensor((C_EDGE,), "float32"),
+        scale: T.float32,
+        threshold: T.float32,
+        slope: T.float32,
+        grad_node_ebd: T.Tensor((N_NODE, C_NODE), "float32"),
+        grad_node_ebd_ext: T.Tensor((N_NODE_EXT, C_NODE), "float32"),
+        grad_edge_ebd: T.Tensor((M, C_EDGE), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(M, BLOCK_M), T.ceildiv(D, BLOCK_N), threads=128) as (bx, by):
+            p = T.alloc_shared((BLOCK_M, BLOCK_K), "float32")
+            w = T.alloc_shared((BLOCK_N, BLOCK_K), "float32")
+            acc = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
+            T.clear(acc)
+            for ko in T.Pipelined(T.ceildiv(C, BLOCK_K), num_stages=2):
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    edge = bx * BLOCK_M + mi
+                    c = ko * BLOCK_K + ki
+                    if edge < M and c < C:
+                        if c < C_NODE:
+                            if HAS_GRAD_NODE:
+                                z = node_preact[edge, c]
+                                deriv = T.alloc_var("float32")
+                                if z >= threshold:
+                                    th = T.tanh(slope * (z - threshold))
+                                    deriv = slope * (1.0 - th * th)
+                                else:
+                                    sig = 1.0 / (1.0 + T.exp(-z))
+                                    deriv = sig * (1.0 + z * (1.0 - sig))
+                                p[mi, ki] = grad_node_output[owner[edge], c] * node_residual[c] * scale * sw[edge] * deriv
+                            else:
+                                p[mi, ki] = 0
+                        else:
+                            ce = c - C_NODE
+                            if HAS_GRAD_EDGE:
+                                z = edge_preact[edge, ce]
+                                deriv = T.alloc_var("float32")
+                                if z >= threshold:
+                                    th = T.tanh(slope * (z - threshold))
+                                    deriv = slope * (1.0 - th * th)
+                                else:
+                                    sig = 1.0 / (1.0 + T.exp(-z))
+                                    deriv = sig * (1.0 + z * (1.0 - sig))
+                                p[mi, ki] = grad_edge_output[edge, ce] * edge_residual[ce] * deriv
+                            else:
+                                p[mi, ki] = 0
+                    else:
+                        p[mi, ki] = 0
+                for ni, ki in T.Parallel(BLOCK_N, BLOCK_K):
+                    d = by * BLOCK_N + ni
+                    c = ko * BLOCK_K + ki
+                    if d < D and c < C:
+                        if c < C_NODE:
+                            w[ni, ki] = node_weight[d, c]
+                        else:
+                            w[ni, ki] = edge_weight[d, c - C_NODE]
+                    else:
+                        w[ni, ki] = 0
+                T.sync_threads()
+                T.gemm(p, w, acc, transpose_B=True)
+                T.sync_threads()
+            for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                edge = bx * BLOCK_M + mi
+                d = by * BLOCK_N + ni
+                if edge < M and d < D:
+                    if d < C_NODE:
+                        T.atomic_add(grad_node_ebd[owner[edge], d], acc[mi, ni])
+                    elif d < 2 * C_NODE:
+                        T.atomic_add(grad_node_ebd_ext[n_ext2e_index[edge], d - C_NODE], acc[mi, ni])
+                    else:
+                        ce = d - 2 * C_NODE
+                        direct = T.alloc_var("float32", init=0)
+                        if HAS_GRAD_EDGE:
+                            direct = grad_edge_output[edge, ce]
+                        grad_edge_ebd[edge, ce] = acc[mi, ni] + direct
+
+    return edge_backward_inputs
+
+
+@tilelang.jit
+def fused_edge_block_backward_weight_partials(
+    M, N_NODE, N_NODE_EXT, C_NODE, C_EDGE, SPLIT_M=1,
+    HAS_GRAD_NODE=True, HAS_GRAD_EDGE=True,
+    BLOCK_D=32, BLOCK_C=32, BLOCK_M=32,
+):
+    D = 2 * C_NODE + C_EDGE
+    C = C_NODE + C_EDGE
+    TILES = (M + BLOCK_M - 1) // BLOCK_M
+    TILES_PER_SPLIT = (TILES + SPLIT_M - 1) // SPLIT_M
+
+    @T.prim_func
+    def edge_backward_weight_partials(
+        grad_node_output: T.Tensor((N_NODE, C_NODE), "float32"),
+        grad_edge_output: T.Tensor((M, C_EDGE), "float32"),
+        node_ebd: T.Tensor((N_NODE, C_NODE), "float32"),
+        node_ebd_ext: T.Tensor((N_NODE_EXT, C_NODE), "float32"),
+        edge_ebd: T.Tensor((M, C_EDGE), "float32"),
+        node_preact: T.Tensor((M, C_NODE), "float32"),
+        edge_preact: T.Tensor((M, C_EDGE), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        owner: T.Tensor((M,), "int64"),
+        n_ext2e_index: T.Tensor((M,), "int64"),
+        node_residual: T.Tensor((C_NODE,), "float32"),
+        edge_residual: T.Tensor((C_EDGE,), "float32"),
+        scale: T.float32,
+        threshold: T.float32,
+        slope: T.float32,
+        node_partials: T.Tensor((SPLIT_M, D, C_NODE), "float32"),
+        edge_partials: T.Tensor((SPLIT_M, D, C_EDGE), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(C, BLOCK_C), SPLIT_M, threads=128) as (bx, by, bs):
+            x = T.alloc_shared((BLOCK_M, BLOCK_D), "float32")
+            p = T.alloc_shared((BLOCK_M, BLOCK_C), "float32")
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_C), "float32")
+            T.clear(acc)
+            for tile in T.Pipelined(TILES_PER_SPLIT, num_stages=2):
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                    edge = (bs * TILES_PER_SPLIT + tile) * BLOCK_M + mi
+                    d = bx * BLOCK_D + di
+                    if edge < M and d < D:
+                        if d < C_NODE:
+                            x[mi, di] = node_ebd[owner[edge], d]
+                        elif d < 2 * C_NODE:
+                            x[mi, di] = node_ebd_ext[n_ext2e_index[edge], d - C_NODE]
+                        else:
+                            x[mi, di] = edge_ebd[edge, d - 2 * C_NODE]
+                    else:
+                        x[mi, di] = 0
+                for mi, ci in T.Parallel(BLOCK_M, BLOCK_C):
+                    edge = (bs * TILES_PER_SPLIT + tile) * BLOCK_M + mi
+                    c = by * BLOCK_C + ci
+                    if edge < M and c < C:
+                        if c < C_NODE:
+                            if HAS_GRAD_NODE:
+                                z = node_preact[edge, c]
+                                deriv = T.alloc_var("float32")
+                                if z >= threshold:
+                                    th = T.tanh(slope * (z - threshold))
+                                    deriv = slope * (1.0 - th * th)
+                                else:
+                                    sig = 1.0 / (1.0 + T.exp(-z))
+                                    deriv = sig * (1.0 + z * (1.0 - sig))
+                                p[mi, ci] = grad_node_output[owner[edge], c] * node_residual[c] * scale * sw[edge] * deriv
+                            else:
+                                p[mi, ci] = 0
+                        else:
+                            ce = c - C_NODE
+                            if HAS_GRAD_EDGE:
+                                z = edge_preact[edge, ce]
+                                deriv = T.alloc_var("float32")
+                                if z >= threshold:
+                                    th = T.tanh(slope * (z - threshold))
+                                    deriv = slope * (1.0 - th * th)
+                                else:
+                                    sig = 1.0 / (1.0 + T.exp(-z))
+                                    deriv = sig * (1.0 + z * (1.0 - sig))
+                                p[mi, ci] = grad_edge_output[edge, ce] * edge_residual[ce] * deriv
+                            else:
+                                p[mi, ci] = 0
+                    else:
+                        p[mi, ci] = 0
+                T.sync_threads()
+                T.gemm(x, p, acc, transpose_A=True)
+                T.sync_threads()
+            for di, ci in T.Parallel(BLOCK_D, BLOCK_C):
+                d = bx * BLOCK_D + di
+                c = by * BLOCK_C + ci
+                if d < D and c < C:
+                    if c < C_NODE:
+                        node_partials[bs, d, c] = acc[di, ci]
+                    else:
+                        edge_partials[bs, d, c - C_NODE] = acc[di, ci]
+
+    return edge_backward_weight_partials
+
+
+@tilelang.jit
+def fused_edge_block_backward_weight_reduce(D, C_NODE, C_EDGE, SPLIT_M):
+    @T.prim_func
+    def edge_backward_weight_reduce(
+        node_partials: T.Tensor((SPLIT_M, D, C_NODE), "float32"),
+        edge_partials: T.Tensor((SPLIT_M, D, C_EDGE), "float32"),
+        grad_node_weight: T.Tensor((D, C_NODE), "float32"),
+        grad_edge_weight: T.Tensor((D, C_EDGE), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(D * (C_NODE + C_EDGE), 256), threads=256) as (bx,):
+            idx = bx * 256 + T.get_thread_binding()
+            if idx < D * (C_NODE + C_EDGE):
+                d = idx // (C_NODE + C_EDGE)
+                c = idx % (C_NODE + C_EDGE)
+                acc = T.alloc_var("float32", init=0)
+                if c < C_NODE:
+                    for s in T.serial(SPLIT_M):
+                        acc += node_partials[s, d, c]
+                    grad_node_weight[d, c] = acc
+                else:
+                    ce = c - C_NODE
+                    for s in T.serial(SPLIT_M):
+                        acc += edge_partials[s, d, ce]
+                    grad_edge_weight[d, ce] = acc
+
+    return edge_backward_weight_reduce
+
+
+@tilelang.jit
+def fused_edge_block_backward_vectors(
+    M, N_NODE, C_NODE, C_EDGE,
+    HAS_GRAD_NODE=True, HAS_GRAD_EDGE=True, THREADS=128,
+):
+    GRID = max(M, C_NODE, C_EDGE)
+
+    @T.prim_func
+    def edge_backward_vectors(
+        grad_node_output: T.Tensor((N_NODE, C_NODE), "float32"),
+        grad_edge_output: T.Tensor((M, C_EDGE), "float32"),
+        node_preact: T.Tensor((M, C_NODE), "float32"),
+        edge_preact: T.Tensor((M, C_EDGE), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        owner: T.Tensor((M,), "int64"),
+        node_residual: T.Tensor((C_NODE,), "float32"),
+        edge_residual: T.Tensor((C_EDGE,), "float32"),
+        scale: T.float32,
+        threshold: T.float32,
+        slope: T.float32,
+        const_value: T.float32,
+        grad_node_bias: T.Tensor((C_NODE,), "float32"),
+        grad_node_residual: T.Tensor((C_NODE,), "float32"),
+        grad_edge_bias: T.Tensor((C_EDGE,), "float32"),
+        grad_edge_residual: T.Tensor((C_EDGE,), "float32"),
+        grad_sw: T.Tensor((M,), "float32"),
+    ):
+        with T.Kernel(GRID, threads=THREADS) as (block,):
+            tx = T.get_thread_binding()
+            sh0 = T.alloc_shared((THREADS,), "float32")
+            sh1 = T.alloc_shared((THREADS,), "float32")
+            if block < C_NODE:
+                acc_b = T.alloc_var("float32", init=0)
+                acc_r = T.alloc_var("float32", init=0)
+                if HAS_GRAD_NODE:
+                    for edge in T.serial(tx, M, THREADS):
+                        z = node_preact[edge, block]
+                        value = T.alloc_var("float32")
+                        deriv = T.alloc_var("float32")
+                        if z >= threshold:
+                            th = T.tanh(slope * (z - threshold))
+                            value = th + const_value
+                            deriv = slope * (1.0 - th * th)
+                        else:
+                            sig = 1.0 / (1.0 + T.exp(-z))
+                            value = z * sig
+                            deriv = sig * (1.0 + z * (1.0 - sig))
+                        g = grad_node_output[owner[edge], block]
+                        acc_b += g * node_residual[block] * scale * sw[edge] * deriv
+                        acc_r += g * scale * sw[edge] * value
+                sh0[tx] = acc_b
+                sh1[tx] = acc_r
+                T.sync_threads()
+                red0 = T.alloc_shared((1,), "float32")
+                red1 = T.alloc_shared((1,), "float32")
+                T.reduce_sum(sh0, red0, dim=0)
+                T.reduce_sum(sh1, red1, dim=0)
+                if tx == 0:
+                    grad_node_bias[block] = red0[0]
+                    grad_node_residual[block] = red1[0]
+            T.sync_threads()
+            if block < C_EDGE:
+                acc_b = T.alloc_var("float32", init=0)
+                acc_r = T.alloc_var("float32", init=0)
+                if HAS_GRAD_EDGE:
+                    for edge in T.serial(tx, M, THREADS):
+                        z = edge_preact[edge, block]
+                        value = T.alloc_var("float32")
+                        deriv = T.alloc_var("float32")
+                        if z >= threshold:
+                            th = T.tanh(slope * (z - threshold))
+                            value = th + const_value
+                            deriv = slope * (1.0 - th * th)
+                        else:
+                            sig = 1.0 / (1.0 + T.exp(-z))
+                            value = z * sig
+                            deriv = sig * (1.0 + z * (1.0 - sig))
+                        g = grad_edge_output[edge, block]
+                        acc_b += g * edge_residual[block] * deriv
+                        acc_r += g * value
+                sh0[tx] = acc_b
+                sh1[tx] = acc_r
+                T.sync_threads()
+                red0 = T.alloc_shared((1,), "float32")
+                red1 = T.alloc_shared((1,), "float32")
+                T.reduce_sum(sh0, red0, dim=0)
+                T.reduce_sum(sh1, red1, dim=0)
+                if tx == 0:
+                    grad_edge_bias[block] = red0[0]
+                    grad_edge_residual[block] = red1[0]
+            T.sync_threads()
+            if block < M:
+                acc_sw = T.alloc_var("float32", init=0)
+                if HAS_GRAD_NODE:
+                    for c in T.serial(tx, C_NODE, THREADS):
+                        z = node_preact[block, c]
+                        value = T.alloc_var("float32")
+                        if z >= threshold:
+                            value = T.tanh(slope * (z - threshold)) + const_value
+                        else:
+                            sig = 1.0 / (1.0 + T.exp(-z))
+                            value = z * sig
+                        acc_sw += grad_node_output[owner[block], c] * node_residual[c] * scale * value
+                sh0[tx] = acc_sw
+                T.sync_threads()
+                red0 = T.alloc_shared((1,), "float32")
+                T.reduce_sum(sh0, red0, dim=0)
+                if tx == 0:
+                    grad_sw[block] = red0[0]
+
+    return edge_backward_vectors
+
+
+@tilelang.jit
+def fused_edge_block_double_prepare(
+    M, N_NODE, N_NODE_EXT, C_NODE, C_EDGE,
+    HAS_GRAD_NODE=True, HAS_GRAD_EDGE=True,
+    HAS_U_NODE=True, HAS_U_NODE_EXT=True, HAS_U_EDGE=True,
+    HAS_U_SW=True, HAS_U_NODE_WEIGHT=True, HAS_U_NODE_BIAS=True,
+    HAS_U_NODE_RESIDUAL=True, HAS_U_EDGE_WEIGHT=True,
+    HAS_U_EDGE_BIAS=True, HAS_U_EDGE_RESIDUAL=True,
+    BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
+):
+    D = 2 * C_NODE + C_EDGE
+    C = C_NODE + C_EDGE
+
+    @T.prim_func
+    def edge_double_prepare(
+        grad_node_output: T.Tensor((N_NODE, C_NODE), "float32"),
+        grad_edge_output: T.Tensor((M, C_EDGE), "float32"),
+        node_ebd: T.Tensor((N_NODE, C_NODE), "float32"),
+        node_ebd_ext: T.Tensor((N_NODE_EXT, C_NODE), "float32"),
+        edge_ebd: T.Tensor((M, C_EDGE), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        owner: T.Tensor((M,), "int64"),
+        n_ext2e_index: T.Tensor((M,), "int64"),
+        node_weight: T.Tensor((D, C_NODE), "float32"),
+        node_residual: T.Tensor((C_NODE,), "float32"),
+        edge_weight: T.Tensor((D, C_EDGE), "float32"),
+        edge_residual: T.Tensor((C_EDGE,), "float32"),
+        node_preact: T.Tensor((M, C_NODE), "float32"),
+        edge_preact: T.Tensor((M, C_EDGE), "float32"),
+        u_node: T.Tensor((N_NODE, C_NODE), "float32"),
+        u_node_ext: T.Tensor((N_NODE_EXT, C_NODE), "float32"),
+        u_edge: T.Tensor((M, C_EDGE), "float32"),
+        u_sw: T.Tensor((M,), "float32"),
+        u_node_weight: T.Tensor((D, C_NODE), "float32"),
+        u_node_bias: T.Tensor((C_NODE,), "float32"),
+        u_node_residual: T.Tensor((C_NODE,), "float32"),
+        u_edge_weight: T.Tensor((D, C_EDGE), "float32"),
+        u_edge_bias: T.Tensor((C_EDGE,), "float32"),
+        u_edge_residual: T.Tensor((C_EDGE,), "float32"),
+        scale: T.float32,
+        threshold: T.float32,
+        slope: T.float32,
+        const_value: T.float32,
+        p_node: T.Tensor((M, C_NODE), "float32"),
+        p_edge: T.Tensor((M, C_EDGE), "float32"),
+        t_node: T.Tensor((M, C_NODE), "float32"),
+        t_edge: T.Tensor((M, C_EDGE), "float32"),
+        s_node: T.Tensor((M, C_NODE), "float32"),
+        s_edge: T.Tensor((M, C_EDGE), "float32"),
+        grad_grad_edge_output: T.Tensor((M, C_EDGE), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(M, BLOCK_M), T.ceildiv(C, BLOCK_N), threads=128) as (bx, by):
+            lhs = T.alloc_shared((BLOCK_M, BLOCK_K), "float32")
+            rhs = T.alloc_shared((BLOCK_K, BLOCK_N), "float32")
+            acc = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
+            T.clear(acc)
+            # uX @ W
+            for ko in T.Pipelined(T.ceildiv(D, BLOCK_K), num_stages=2):
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    edge = bx * BLOCK_M + mi
+                    d = ko * BLOCK_K + ki
+                    if edge < M and d < D:
+                        if d < C_NODE:
+                            if HAS_U_NODE:
+                                lhs[mi, ki] = u_node[owner[edge], d]
+                            else:
+                                lhs[mi, ki] = 0
+                        elif d < 2 * C_NODE:
+                            if HAS_U_NODE_EXT:
+                                lhs[mi, ki] = u_node_ext[n_ext2e_index[edge], d - C_NODE]
+                            else:
+                                lhs[mi, ki] = 0
+                        else:
+                            if HAS_U_EDGE:
+                                lhs[mi, ki] = u_edge[edge, d - 2 * C_NODE]
+                            else:
+                                lhs[mi, ki] = 0
+                    else:
+                        lhs[mi, ki] = 0
+                for ki, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                    d = ko * BLOCK_K + ki
+                    c = by * BLOCK_N + ni
+                    if d < D and c < C:
+                        if c < C_NODE:
+                            rhs[ki, ni] = node_weight[d, c]
+                        else:
+                            rhs[ki, ni] = edge_weight[d, c - C_NODE]
+                    else:
+                        rhs[ki, ni] = 0
+                T.sync_threads()
+                T.gemm(lhs, rhs, acc)
+                T.sync_threads()
+            # X @ uW, with both heads logically concatenated.
+            if HAS_U_NODE_WEIGHT or HAS_U_EDGE_WEIGHT:
+                for ko in T.Pipelined(T.ceildiv(D, BLOCK_K), num_stages=2):
+                    for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                        edge = bx * BLOCK_M + mi
+                        d = ko * BLOCK_K + ki
+                        if edge < M and d < D:
+                            if d < C_NODE:
+                                lhs[mi, ki] = node_ebd[owner[edge], d]
+                            elif d < 2 * C_NODE:
+                                lhs[mi, ki] = node_ebd_ext[n_ext2e_index[edge], d - C_NODE]
+                            else:
+                                lhs[mi, ki] = edge_ebd[edge, d - 2 * C_NODE]
+                        else:
+                            lhs[mi, ki] = 0
+                    for ki, ni in T.Parallel(BLOCK_K, BLOCK_N):
+                        d = ko * BLOCK_K + ki
+                        c = by * BLOCK_N + ni
+                        if d < D and c < C:
+                            if c < C_NODE:
+                                if HAS_U_NODE_WEIGHT:
+                                    rhs[ki, ni] = u_node_weight[d, c]
+                                else:
+                                    rhs[ki, ni] = 0
+                            else:
+                                if HAS_U_EDGE_WEIGHT:
+                                    rhs[ki, ni] = u_edge_weight[d, c - C_NODE]
+                                else:
+                                    rhs[ki, ni] = 0
+                        else:
+                            rhs[ki, ni] = 0
+                    T.sync_threads()
+                    T.gemm(lhs, rhs, acc)
+                    T.sync_threads()
+            for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                edge = bx * BLOCK_M + mi
+                c = by * BLOCK_N + ni
+                if edge < M and c < C:
+                    if c < C_NODE:
+                        t = acc[mi, ni]
+                        if HAS_U_NODE_BIAS:
+                            t += u_node_bias[c]
+                        z = node_preact[edge, c]
+                        value = T.alloc_var("float32")
+                        deriv = T.alloc_var("float32")
+                        second = T.alloc_var("float32")
+                        if z >= threshold:
+                            th = T.tanh(slope * (z - threshold))
+                            value = th + const_value
+                            deriv = slope * (1.0 - th * th)
+                            second = -2.0 * slope * th * deriv
+                        else:
+                            sig = 1.0 / (1.0 + T.exp(-z))
+                            value = z * sig
+                            deriv = sig * (1.0 + z * (1.0 - sig))
+                            second = sig * (1.0 - sig) * (2.0 + z * (1.0 - 2.0 * sig))
+                        g = T.alloc_var("float32", init=0)
+                        if HAS_GRAD_NODE:
+                            g = grad_node_output[owner[edge], c]
+                        p = g * node_residual[c] * scale * sw[edge] * deriv
+                        s = g * scale * sw[edge] * node_residual[c] * second * t
+                        if HAS_U_NODE_RESIDUAL:
+                            s += g * scale * sw[edge] * u_node_residual[c] * deriv
+                        if HAS_U_SW:
+                            s += g * scale * u_sw[edge] * node_residual[c] * deriv
+                        p_node[edge, c] = p
+                        t_node[edge, c] = t
+                        s_node[edge, c] = s
+                    else:
+                        ce = c - C_NODE
+                        t = acc[mi, ni]
+                        if HAS_U_EDGE_BIAS:
+                            t += u_edge_bias[ce]
+                        z = edge_preact[edge, ce]
+                        value = T.alloc_var("float32")
+                        deriv = T.alloc_var("float32")
+                        second = T.alloc_var("float32")
+                        if z >= threshold:
+                            th = T.tanh(slope * (z - threshold))
+                            value = th + const_value
+                            deriv = slope * (1.0 - th * th)
+                            second = -2.0 * slope * th * deriv
+                        else:
+                            sig = 1.0 / (1.0 + T.exp(-z))
+                            value = z * sig
+                            deriv = sig * (1.0 + z * (1.0 - sig))
+                            second = sig * (1.0 - sig) * (2.0 + z * (1.0 - 2.0 * sig))
+                        g = T.alloc_var("float32", init=0)
+                        if HAS_GRAD_EDGE:
+                            g = grad_edge_output[edge, ce]
+                        p = g * edge_residual[ce] * deriv
+                        s = g * edge_residual[ce] * second * t
+                        if HAS_U_EDGE_RESIDUAL:
+                            s += g * u_edge_residual[ce] * deriv
+                        p_edge[edge, ce] = p
+                        t_edge[edge, ce] = t
+                        s_edge[edge, ce] = s
+                        gg = edge_residual[ce] * deriv * t
+                        if HAS_U_EDGE:
+                            gg += u_edge[edge, ce]
+                        if HAS_U_EDGE_RESIDUAL:
+                            gg += u_edge_residual[ce] * value
+                        grad_grad_edge_output[edge, ce] = gg
+
+    return edge_double_prepare
+
+
+@tilelang.jit
+def fused_edge_block_double_node_output_uniform(
+    M, NO, C_NODE, HAS_U_NODE_PARTIAL=True,
+    HAS_U_SW=True, HAS_U_NODE_RESIDUAL=True, THREADS=128,
+):
+    assert M % NO == 0
+    EDGES_PER_OWNER = M // NO
+
+    @T.prim_func
+    def edge_double_node_output_uniform(
+        node_preact: T.Tensor((M, C_NODE), "float32"),
+        t_node: T.Tensor((M, C_NODE), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        node_residual: T.Tensor((C_NODE,), "float32"),
+        u_node_partial: T.Tensor((NO, C_NODE), "float32"),
+        u_sw: T.Tensor((M,), "float32"),
+        u_node_residual: T.Tensor((C_NODE,), "float32"),
+        scale: T.float32,
+        threshold: T.float32,
+        slope: T.float32,
+        const_value: T.float32,
+        grad_grad_node_output: T.Tensor((NO, C_NODE), "float32"),
+    ):
+        with T.Kernel(NO, T.ceildiv(C_NODE, THREADS), threads=THREADS) as (owner_id, tile):
+            c = tile * THREADS + T.get_thread_binding()
+            if c < C_NODE:
+                acc = T.alloc_var("float32", init=0)
+                if HAS_U_NODE_PARTIAL:
+                    acc = u_node_partial[owner_id, c]
+                for r in T.serial(EDGES_PER_OWNER):
+                    edge = owner_id * EDGES_PER_OWNER + r
+                    z = node_preact[edge, c]
+                    value = T.alloc_var("float32")
+                    deriv = T.alloc_var("float32")
+                    if z >= threshold:
+                        th = T.tanh(slope * (z - threshold))
+                        value = th + const_value
+                        deriv = slope * (1.0 - th * th)
+                    else:
+                        sig = 1.0 / (1.0 + T.exp(-z))
+                        value = z * sig
+                        deriv = sig * (1.0 + z * (1.0 - sig))
+                    acc += scale * sw[edge] * node_residual[c] * deriv * t_node[edge, c]
+                    if HAS_U_NODE_RESIDUAL:
+                        acc += scale * sw[edge] * u_node_residual[c] * value
+                    if HAS_U_SW:
+                        acc += scale * u_sw[edge] * node_residual[c] * value
+                grad_grad_node_output[owner_id, c] = acc
+
+    return edge_double_node_output_uniform
+
+
+@tilelang.jit
+def fused_edge_block_double_node_output_segmented(
+    M, NO, C_NODE, HAS_U_NODE_PARTIAL=True,
+    HAS_U_SW=True, HAS_U_NODE_RESIDUAL=True, THREADS=128,
+):
+    @T.prim_func
+    def edge_double_node_output_segmented(
+        node_preact: T.Tensor((M, C_NODE), "float32"),
+        t_node: T.Tensor((M, C_NODE), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        node_residual: T.Tensor((C_NODE,), "float32"),
+        u_node_partial: T.Tensor((NO, C_NODE), "float32"),
+        u_sw: T.Tensor((M,), "float32"),
+        u_node_residual: T.Tensor((C_NODE,), "float32"),
+        offsets: T.Tensor((NO + 1,), "int64"),
+        order: T.Tensor((M,), "int64"),
+        scale: T.float32,
+        threshold: T.float32,
+        slope: T.float32,
+        const_value: T.float32,
+        grad_grad_node_output: T.Tensor((NO, C_NODE), "float32"),
+    ):
+        with T.Kernel(NO, T.ceildiv(C_NODE, THREADS), threads=THREADS) as (owner_id, tile):
+            c = tile * THREADS + T.get_thread_binding()
+            if c < C_NODE:
+                acc = T.alloc_var("float32", init=0)
+                if HAS_U_NODE_PARTIAL:
+                    acc = u_node_partial[owner_id, c]
+                for r in T.serial(offsets[owner_id], offsets[owner_id + 1]):
+                    edge = order[r]
+                    z = node_preact[edge, c]
+                    value = T.alloc_var("float32")
+                    deriv = T.alloc_var("float32")
+                    if z >= threshold:
+                        th = T.tanh(slope * (z - threshold))
+                        value = th + const_value
+                        deriv = slope * (1.0 - th * th)
+                    else:
+                        sig = 1.0 / (1.0 + T.exp(-z))
+                        value = z * sig
+                        deriv = sig * (1.0 + z * (1.0 - sig))
+                    acc += scale * sw[edge] * node_residual[c] * deriv * t_node[edge, c]
+                    if HAS_U_NODE_RESIDUAL:
+                        acc += scale * sw[edge] * u_node_residual[c] * value
+                    if HAS_U_SW:
+                        acc += scale * u_sw[edge] * node_residual[c] * value
+                grad_grad_node_output[owner_id, c] = acc
+
+    return edge_double_node_output_segmented
+
+
+@tilelang.jit
+def fused_edge_block_double_inputs(
+    M, N_NODE, N_NODE_EXT, C_NODE, C_EDGE,
+    HAS_U_NODE_WEIGHT=True, HAS_U_EDGE_WEIGHT=True,
+    BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
+):
+    D = 2 * C_NODE + C_EDGE
+    C = C_NODE + C_EDGE
+
+    @T.prim_func
+    def edge_double_inputs(
+        p_node: T.Tensor((M, C_NODE), "float32"),
+        p_edge: T.Tensor((M, C_EDGE), "float32"),
+        s_node: T.Tensor((M, C_NODE), "float32"),
+        s_edge: T.Tensor((M, C_EDGE), "float32"),
+        node_weight: T.Tensor((D, C_NODE), "float32"),
+        edge_weight: T.Tensor((D, C_EDGE), "float32"),
+        u_node_weight: T.Tensor((D, C_NODE), "float32"),
+        u_edge_weight: T.Tensor((D, C_EDGE), "float32"),
+        owner: T.Tensor((M,), "int64"),
+        n_ext2e_index: T.Tensor((M,), "int64"),
+        grad_node_ebd: T.Tensor((N_NODE, C_NODE), "float32"),
+        grad_node_ebd_ext: T.Tensor((N_NODE_EXT, C_NODE), "float32"),
+        grad_edge_ebd: T.Tensor((M, C_EDGE), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(M, BLOCK_M), T.ceildiv(D, BLOCK_N), threads=128) as (bx, by):
+            lhs = T.alloc_shared((BLOCK_M, BLOCK_K), "float32")
+            rhs = T.alloc_shared((BLOCK_N, BLOCK_K), "float32")
+            acc = T.alloc_fragment((BLOCK_M, BLOCK_N), "float32")
+            T.clear(acc)
+            for ko in T.Pipelined(T.ceildiv(2 * C, BLOCK_K), num_stages=2):
+                for mi, ki in T.Parallel(BLOCK_M, BLOCK_K):
+                    edge = bx * BLOCK_M + mi
+                    k = ko * BLOCK_K + ki
+                    if edge < M and k < 2 * C:
+                        c = k % C
+                        if c < C_NODE:
+                            if k >= C:
+                                lhs[mi, ki] = s_node[edge, c]
+                            else:
+                                lhs[mi, ki] = p_node[edge, c]
+                        else:
+                            ce = c - C_NODE
+                            if k >= C:
+                                lhs[mi, ki] = s_edge[edge, ce]
+                            else:
+                                lhs[mi, ki] = p_edge[edge, ce]
+                    else:
+                        lhs[mi, ki] = 0
+                for ni, ki in T.Parallel(BLOCK_N, BLOCK_K):
+                    d = by * BLOCK_N + ni
+                    k = ko * BLOCK_K + ki
+                    if d < D and k < 2 * C:
+                        c = k % C
+                        if c < C_NODE:
+                            if k >= C:
+                                rhs[ni, ki] = node_weight[d, c]
+                            elif HAS_U_NODE_WEIGHT:
+                                rhs[ni, ki] = u_node_weight[d, c]
+                            else:
+                                rhs[ni, ki] = 0
+                        else:
+                            ce = c - C_NODE
+                            if k >= C:
+                                rhs[ni, ki] = edge_weight[d, ce]
+                            elif HAS_U_EDGE_WEIGHT:
+                                rhs[ni, ki] = u_edge_weight[d, ce]
+                            else:
+                                rhs[ni, ki] = 0
+                    else:
+                        rhs[ni, ki] = 0
+                T.sync_threads()
+                T.gemm(lhs, rhs, acc, transpose_B=True)
+                T.sync_threads()
+            for mi, ni in T.Parallel(BLOCK_M, BLOCK_N):
+                edge = bx * BLOCK_M + mi
+                d = by * BLOCK_N + ni
+                if edge < M and d < D:
+                    if d < C_NODE:
+                        T.atomic_add(grad_node_ebd[owner[edge], d], acc[mi, ni])
+                    elif d < 2 * C_NODE:
+                        T.atomic_add(grad_node_ebd_ext[n_ext2e_index[edge], d - C_NODE], acc[mi, ni])
+                    else:
+                        grad_edge_ebd[edge, d - 2 * C_NODE] = acc[mi, ni]
+
+    return edge_double_inputs
+
+
+@tilelang.jit
+def fused_edge_block_double_weight_partials(
+    M, N_NODE, N_NODE_EXT, C_NODE, C_EDGE, SPLIT_M=1,
+    HAS_U_NODE=True, HAS_U_NODE_EXT=True, HAS_U_EDGE=True,
+    BLOCK_D=32, BLOCK_C=32, BLOCK_M=32,
+):
+    D = 2 * C_NODE + C_EDGE
+    C = C_NODE + C_EDGE
+    TILES = (M + BLOCK_M - 1) // BLOCK_M
+    TILES_PER_SPLIT = (TILES + SPLIT_M - 1) // SPLIT_M
+
+    @T.prim_func
+    def edge_double_weight_partials(
+        node_ebd: T.Tensor((N_NODE, C_NODE), "float32"),
+        node_ebd_ext: T.Tensor((N_NODE_EXT, C_NODE), "float32"),
+        edge_ebd: T.Tensor((M, C_EDGE), "float32"),
+        u_node: T.Tensor((N_NODE, C_NODE), "float32"),
+        u_node_ext: T.Tensor((N_NODE_EXT, C_NODE), "float32"),
+        u_edge: T.Tensor((M, C_EDGE), "float32"),
+        owner: T.Tensor((M,), "int64"),
+        n_ext2e_index: T.Tensor((M,), "int64"),
+        p_node: T.Tensor((M, C_NODE), "float32"),
+        p_edge: T.Tensor((M, C_EDGE), "float32"),
+        s_node: T.Tensor((M, C_NODE), "float32"),
+        s_edge: T.Tensor((M, C_EDGE), "float32"),
+        node_partials: T.Tensor((SPLIT_M, D, C_NODE), "float32"),
+        edge_partials: T.Tensor((SPLIT_M, D, C_EDGE), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(D, BLOCK_D), T.ceildiv(C, BLOCK_C), SPLIT_M, threads=128) as (bx, by, bs):
+            lhs = T.alloc_shared((BLOCK_M, BLOCK_D), "float32")
+            rhs = T.alloc_shared((BLOCK_M, BLOCK_C), "float32")
+            acc = T.alloc_fragment((BLOCK_D, BLOCK_C), "float32")
+            T.clear(acc)
+            # [uX; X].T @ [P; S] keeps both heads in one logical GEMM.
+            for ko in T.Pipelined(2 * TILES_PER_SPLIT, num_stages=2):
+                local_tile = ko % TILES_PER_SPLIT
+                for mi, di in T.Parallel(BLOCK_M, BLOCK_D):
+                    edge = (bs * TILES_PER_SPLIT + local_tile) * BLOCK_M + mi
+                    d = bx * BLOCK_D + di
+                    if edge < M and d < D:
+                        if ko >= TILES_PER_SPLIT:
+                            if d < C_NODE:
+                                lhs[mi, di] = node_ebd[owner[edge], d]
+                            elif d < 2 * C_NODE:
+                                lhs[mi, di] = node_ebd_ext[n_ext2e_index[edge], d - C_NODE]
+                            else:
+                                lhs[mi, di] = edge_ebd[edge, d - 2 * C_NODE]
+                        else:
+                            if d < C_NODE:
+                                if HAS_U_NODE:
+                                    lhs[mi, di] = u_node[owner[edge], d]
+                                else:
+                                    lhs[mi, di] = 0
+                            elif d < 2 * C_NODE:
+                                if HAS_U_NODE_EXT:
+                                    lhs[mi, di] = u_node_ext[n_ext2e_index[edge], d - C_NODE]
+                                else:
+                                    lhs[mi, di] = 0
+                            else:
+                                if HAS_U_EDGE:
+                                    lhs[mi, di] = u_edge[edge, d - 2 * C_NODE]
+                                else:
+                                    lhs[mi, di] = 0
+                    else:
+                        lhs[mi, di] = 0
+                for mi, ci in T.Parallel(BLOCK_M, BLOCK_C):
+                    edge = (bs * TILES_PER_SPLIT + local_tile) * BLOCK_M + mi
+                    c = by * BLOCK_C + ci
+                    if edge < M and c < C:
+                        if c < C_NODE:
+                            if ko >= TILES_PER_SPLIT:
+                                rhs[mi, ci] = s_node[edge, c]
+                            else:
+                                rhs[mi, ci] = p_node[edge, c]
+                        else:
+                            if ko >= TILES_PER_SPLIT:
+                                rhs[mi, ci] = s_edge[edge, c - C_NODE]
+                            else:
+                                rhs[mi, ci] = p_edge[edge, c - C_NODE]
+                    else:
+                        rhs[mi, ci] = 0
+                T.sync_threads()
+                T.gemm(lhs, rhs, acc, transpose_A=True)
+                T.sync_threads()
+            for di, ci in T.Parallel(BLOCK_D, BLOCK_C):
+                d = bx * BLOCK_D + di
+                c = by * BLOCK_C + ci
+                if d < D and c < C:
+                    if c < C_NODE:
+                        node_partials[bs, d, c] = acc[di, ci]
+                    else:
+                        edge_partials[bs, d, c - C_NODE] = acc[di, ci]
+
+    return edge_double_weight_partials
+
+
+@tilelang.jit
+def fused_edge_block_double_weight_reduce(D, C_NODE, C_EDGE, SPLIT_M):
+    """Reduce split-M second-order weight partials when SPLIT_M > 1."""
+
+    @T.prim_func
+    def edge_double_weight_reduce(
+        node_partials: T.Tensor((SPLIT_M, D, C_NODE), "float32"),
+        edge_partials: T.Tensor((SPLIT_M, D, C_EDGE), "float32"),
+        grad_node_weight: T.Tensor((D, C_NODE), "float32"),
+        grad_edge_weight: T.Tensor((D, C_EDGE), "float32"),
+    ):
+        with T.Kernel(T.ceildiv(D * (C_NODE + C_EDGE), 256), threads=256) as (bx,):
+            idx = bx * 256 + T.get_thread_binding()
+            if idx < D * (C_NODE + C_EDGE):
+                d = idx // (C_NODE + C_EDGE)
+                c = idx % (C_NODE + C_EDGE)
+                acc = T.alloc_var("float32", init=0)
+                if c < C_NODE:
+                    for s in T.serial(SPLIT_M):
+                        acc += node_partials[s, d, c]
+                    grad_node_weight[d, c] = acc
+                else:
+                    ce = c - C_NODE
+                    for s in T.serial(SPLIT_M):
+                        acc += edge_partials[s, d, ce]
+                    grad_edge_weight[d, ce] = acc
+
+    return edge_double_weight_reduce
+
+
+@tilelang.jit
+def fused_edge_block_double_vectors(
+    M, N_NODE, C_NODE, C_EDGE,
+    HAS_GRAD_NODE=True, HAS_GRAD_EDGE=True,
+    HAS_U_SW=True, HAS_U_NODE_RESIDUAL=True, THREADS=128,
+):
+    GRID = max(M, C_NODE, C_EDGE)
+
+    @T.prim_func
+    def edge_double_vectors(
+        grad_node_output: T.Tensor((N_NODE, C_NODE), "float32"),
+        grad_edge_output: T.Tensor((M, C_EDGE), "float32"),
+        node_preact: T.Tensor((M, C_NODE), "float32"),
+        edge_preact: T.Tensor((M, C_EDGE), "float32"),
+        t_node: T.Tensor((M, C_NODE), "float32"),
+        t_edge: T.Tensor((M, C_EDGE), "float32"),
+        s_node: T.Tensor((M, C_NODE), "float32"),
+        s_edge: T.Tensor((M, C_EDGE), "float32"),
+        sw: T.Tensor((M,), "float32"),
+        owner: T.Tensor((M,), "int64"),
+        node_residual: T.Tensor((C_NODE,), "float32"),
+        u_sw: T.Tensor((M,), "float32"),
+        u_node_residual: T.Tensor((C_NODE,), "float32"),
+        scale: T.float32,
+        threshold: T.float32,
+        slope: T.float32,
+        const_value: T.float32,
+        grad_node_bias: T.Tensor((C_NODE,), "float32"),
+        grad_node_residual: T.Tensor((C_NODE,), "float32"),
+        grad_edge_bias: T.Tensor((C_EDGE,), "float32"),
+        grad_edge_residual: T.Tensor((C_EDGE,), "float32"),
+        grad_sw: T.Tensor((M,), "float32"),
+    ):
+        with T.Kernel(GRID, threads=THREADS) as (block,):
+            tx = T.get_thread_binding()
+            sh0 = T.alloc_shared((THREADS,), "float32")
+            sh1 = T.alloc_shared((THREADS,), "float32")
+            if block < C_NODE:
+                acc_b = T.alloc_var("float32", init=0)
+                acc_r = T.alloc_var("float32", init=0)
+                if HAS_GRAD_NODE:
+                    for edge in T.serial(tx, M, THREADS):
+                        z = node_preact[edge, block]
+                        value = T.alloc_var("float32")
+                        deriv = T.alloc_var("float32")
+                        if z >= threshold:
+                            th = T.tanh(slope * (z - threshold))
+                            value = th + const_value
+                            deriv = slope * (1.0 - th * th)
+                        else:
+                            sig = 1.0 / (1.0 + T.exp(-z))
+                            value = z * sig
+                            deriv = sig * (1.0 + z * (1.0 - sig))
+                        acc_b += s_node[edge, block]
+                        acc_r += grad_node_output[owner[edge], block] * scale * sw[edge] * deriv * t_node[edge, block]
+                        if HAS_U_SW:
+                            acc_r += grad_node_output[owner[edge], block] * scale * u_sw[edge] * value
+                sh0[tx] = acc_b
+                sh1[tx] = acc_r
+                T.sync_threads()
+                red0 = T.alloc_shared((1,), "float32")
+                red1 = T.alloc_shared((1,), "float32")
+                T.reduce_sum(sh0, red0, dim=0)
+                T.reduce_sum(sh1, red1, dim=0)
+                if tx == 0:
+                    grad_node_bias[block] = red0[0]
+                    grad_node_residual[block] = red1[0]
+            T.sync_threads()
+            if block < C_EDGE:
+                acc_b = T.alloc_var("float32", init=0)
+                acc_r = T.alloc_var("float32", init=0)
+                if HAS_GRAD_EDGE:
+                    for edge in T.serial(tx, M, THREADS):
+                        z = edge_preact[edge, block]
+                        deriv = T.alloc_var("float32")
+                        if z >= threshold:
+                            th = T.tanh(slope * (z - threshold))
+                            deriv = slope * (1.0 - th * th)
+                        else:
+                            sig = 1.0 / (1.0 + T.exp(-z))
+                            deriv = sig * (1.0 + z * (1.0 - sig))
+                        acc_b += s_edge[edge, block]
+                        acc_r += grad_edge_output[edge, block] * deriv * t_edge[edge, block]
+                sh0[tx] = acc_b
+                sh1[tx] = acc_r
+                T.sync_threads()
+                red0 = T.alloc_shared((1,), "float32")
+                red1 = T.alloc_shared((1,), "float32")
+                T.reduce_sum(sh0, red0, dim=0)
+                T.reduce_sum(sh1, red1, dim=0)
+                if tx == 0:
+                    grad_edge_bias[block] = red0[0]
+                    grad_edge_residual[block] = red1[0]
+            T.sync_threads()
+            if block < M:
+                acc_sw = T.alloc_var("float32", init=0)
+                if HAS_GRAD_NODE:
+                    for c in T.serial(tx, C_NODE, THREADS):
+                        z = node_preact[block, c]
+                        value = T.alloc_var("float32")
+                        deriv = T.alloc_var("float32")
+                        if z >= threshold:
+                            th = T.tanh(slope * (z - threshold))
+                            value = th + const_value
+                            deriv = slope * (1.0 - th * th)
+                        else:
+                            sig = 1.0 / (1.0 + T.exp(-z))
+                            value = z * sig
+                            deriv = sig * (1.0 + z * (1.0 - sig))
+                        acc_sw += grad_node_output[owner[block], c] * scale * node_residual[c] * deriv * t_node[block, c]
+                        if HAS_U_NODE_RESIDUAL:
+                            acc_sw += grad_node_output[owner[block], c] * scale * u_node_residual[c] * value
+                sh0[tx] = acc_sw
+                T.sync_threads()
+                red0 = T.alloc_shared((1,), "float32")
+                T.reduce_sum(sh0, red0, dim=0)
+                if tx == 0:
+                    grad_sw[block] = red0[0]
+
+    return edge_double_vectors
+
+
+class FusedEdgeBlockFunction(torch.autograd.Function):
+    """Projection, activation, owner reduction, and both residual updates."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        node_partial,
+        node_ebd,
+        node_ebd_ext,
+        edge_ebd,
+        sw,
+        owner,
+        n_ext2e_index,
+        node_weight,
+        node_bias,
+        node_residual,
+        edge_weight,
+        edge_bias,
+        edge_residual,
+        num_owner,
+        scale_factor,
+        threshold,
+        slope,
+        const_value,
+        owner_metadata,
+    ):
+        node_partial = node_partial.contiguous()
+        node_ebd = node_ebd.contiguous()
+        node_ebd_ext = node_ebd_ext.contiguous()
+        edge_ebd = edge_ebd.contiguous()
+        sw = sw.contiguous()
+        owner = owner.long().contiguous()
+        n_ext2e_index = n_ext2e_index.long().contiguous()
+        node_weight = node_weight.contiguous()
+        node_bias = node_bias.contiguous()
+        node_residual = node_residual.contiguous()
+        edge_weight = edge_weight.contiguous()
+        edge_bias = edge_bias.contiguous()
+        edge_residual = edge_residual.contiguous()
+        M, c_edge = edge_ebd.shape
+        n_node, c_node = node_ebd.shape
+        n_node_ext = node_ebd_ext.shape[0]
+        if node_weight.shape != (2 * c_node + c_edge, c_node):
+            raise ValueError("node Edge projection has an unexpected shape")
+        if edge_weight.shape != (2 * c_node + c_edge, c_edge):
+            raise ValueError("edge Edge projection must preserve edge width")
+
+        node_preact = torch.empty(
+            (M, c_node), device=edge_ebd.device, dtype=edge_ebd.dtype,
+        )
+        edge_preact = torch.empty_like(edge_ebd)
+        edge_partial = torch.empty_like(edge_ebd)
+        if M:
+            projection = fused_edge_block_projection_forward(
+                M=M, N_NODE=n_node, N_NODE_EXT=n_node_ext,
+                C_NODE=c_node, C_EDGE=c_edge,
+            )
+            projection(
+                node_ebd, node_ebd_ext, edge_ebd, owner, n_ext2e_index,
+                node_weight, node_bias, edge_weight, edge_bias, edge_residual,
+                float(threshold), float(slope), float(const_value),
+                node_preact, edge_preact, edge_partial,
+            )
+        else:
+            edge_partial.copy_(edge_ebd)
+
+        node_output = torch.empty_like(node_partial)
+        uniform, offsets, order = owner_metadata
+        if M == 0:
+            node_output.copy_(node_partial)
+        elif uniform:
+            reduce_forward = fused_edge_block_node_reduce_forward_uniform(
+                M=M, NO=num_owner, C_NODE=c_node,
+            )
+            reduce_forward(
+                node_partial, node_preact, sw, node_residual,
+                float(scale_factor), float(threshold), float(slope),
+                float(const_value), node_output,
+            )
+        else:
+            reduce_forward = fused_edge_block_node_reduce_forward_segmented(
+                M=M, NO=num_owner, C_NODE=c_node,
+            )
+            reduce_forward(
+                node_partial, node_preact, sw, node_residual, offsets, order,
+                float(scale_factor), float(threshold), float(slope),
+                float(const_value), node_output,
+            )
+
+        ctx.set_materialize_grads(False)
+        ctx.owner_metadata = owner_metadata
+        ctx.num_owner = num_owner
+        ctx.scale_factor = scale_factor
+        ctx.threshold = threshold
+        ctx.slope = slope
+        ctx.const_value = const_value
+        ctx.save_for_backward(
+            node_partial, node_ebd, node_ebd_ext, edge_ebd, sw,
+            owner, n_ext2e_index, node_weight, node_bias, node_residual,
+            edge_weight, edge_bias, edge_residual, node_preact, edge_preact,
+        )
+        return node_output, edge_partial
+
+    @staticmethod
+    def backward(ctx, grad_node_output, grad_edge_output):
+        (
+            node_partial, node_ebd, node_ebd_ext, edge_ebd, sw,
+            owner, n_ext2e_index, node_weight, node_bias, node_residual,
+            edge_weight, edge_bias, edge_residual, node_preact, edge_preact,
+        ) = ctx.saved_tensors
+        has_grad_node = grad_node_output is not None
+        has_grad_edge = grad_edge_output is not None
+        if not has_grad_node and not has_grad_edge:
+            return (None,) * 19
+        grad_node_arg = (
+            grad_node_output.contiguous()
+            if has_grad_node else node_partial.detach()
+        )
+        grad_edge_arg = (
+            grad_edge_output.contiguous()
+            if has_grad_edge else edge_ebd.detach()
+        )
+        grads = FusedEdgeBlockFunctionBackward.apply(
+            grad_node_arg, grad_edge_arg,
+            node_partial, node_ebd, node_ebd_ext, edge_ebd, sw,
+            owner, n_ext2e_index, node_weight, node_bias, node_residual,
+            edge_weight, edge_bias, edge_residual, node_preact, edge_preact,
+            ctx.num_owner, ctx.scale_factor, ctx.threshold, ctx.slope,
+            ctx.const_value, ctx.owner_metadata, has_grad_node, has_grad_edge,
+        )
+        (
+            grad_node_partial, grad_node, grad_node_ext, grad_edge, grad_sw,
+            grad_node_weight, grad_node_bias, grad_node_residual,
+            grad_edge_weight, grad_edge_bias, grad_edge_residual,
+        ) = grads
+        return (
+            grad_node_partial if has_grad_node else None,
+            grad_node, grad_node_ext, grad_edge, grad_sw,
+            None, None,
+            grad_node_weight, grad_node_bias, grad_node_residual,
+            grad_edge_weight, grad_edge_bias, grad_edge_residual,
+            None, None, None, None, None, None,
+        )
+
+
+class FusedEdgeBlockFunctionBackward(torch.autograd.Function):
+    """First derivative of the wider Edge block, with fused double backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        grad_node_output,
+        grad_edge_output,
+        node_partial,
+        node_ebd,
+        node_ebd_ext,
+        edge_ebd,
+        sw,
+        owner,
+        n_ext2e_index,
+        node_weight,
+        node_bias,
+        node_residual,
+        edge_weight,
+        edge_bias,
+        edge_residual,
+        node_preact,
+        edge_preact,
+        num_owner,
+        scale_factor,
+        threshold,
+        slope,
+        const_value,
+        owner_metadata,
+        has_grad_node,
+        has_grad_edge,
+    ):
+        M, c_edge = edge_ebd.shape
+        n_node, c_node = node_ebd.shape
+        n_node_ext = node_ebd_ext.shape[0]
+        d = 2 * c_node + c_edge
+        grad_node = torch.zeros_like(node_ebd)
+        grad_node_ext = torch.zeros_like(node_ebd_ext)
+        grad_edge = torch.empty_like(edge_ebd)
+        if M:
+            inputs_kernel = fused_edge_block_backward_inputs(
+                M=M, N_NODE=n_node, N_NODE_EXT=n_node_ext,
+                C_NODE=c_node, C_EDGE=c_edge,
+                HAS_GRAD_NODE=has_grad_node, HAS_GRAD_EDGE=has_grad_edge,
+            )
+            inputs_kernel(
+                grad_node_output, grad_edge_output, node_preact, edge_preact,
+                sw, owner, n_ext2e_index, node_weight, node_residual,
+                edge_weight, edge_residual, float(scale_factor),
+                float(threshold), float(slope),
+                grad_node, grad_node_ext, grad_edge,
+            )
+        else:
+            grad_edge.zero_()
+
+        # Keep the split interface, but do not pay workspace/reduction overhead
+        # unless a future tuned configuration explicitly selects SPLIT_M > 1.
+        split_m = 1
+        grad_node_weight = torch.empty_like(node_weight)
+        grad_edge_weight = torch.empty_like(edge_weight)
+        if M:
+            weight_kernel = fused_edge_block_backward_weight_partials(
+                M=M, N_NODE=n_node, N_NODE_EXT=n_node_ext,
+                C_NODE=c_node, C_EDGE=c_edge, SPLIT_M=split_m,
+                HAS_GRAD_NODE=has_grad_node, HAS_GRAD_EDGE=has_grad_edge,
+            )
+            if split_m == 1:
+                node_partials = grad_node_weight.unsqueeze(0)
+                edge_partials = grad_edge_weight.unsqueeze(0)
+            else:
+                node_partials = torch.empty(
+                    (split_m, d, c_node), device=edge_ebd.device,
+                    dtype=edge_ebd.dtype,
+                )
+                edge_partials = torch.empty(
+                    (split_m, d, c_edge), device=edge_ebd.device,
+                    dtype=edge_ebd.dtype,
+                )
+            weight_kernel(
+                grad_node_output, grad_edge_output,
+                node_ebd, node_ebd_ext, edge_ebd,
+                node_preact, edge_preact, sw, owner, n_ext2e_index,
+                node_residual, edge_residual, float(scale_factor),
+                float(threshold), float(slope), node_partials, edge_partials,
+            )
+            if split_m > 1:
+                reduce_kernel = fused_edge_block_backward_weight_reduce(
+                    D=d, C_NODE=c_node, C_EDGE=c_edge, SPLIT_M=split_m,
+                )
+                reduce_kernel(
+                    node_partials, edge_partials,
+                    grad_node_weight, grad_edge_weight,
+                )
+        else:
+            grad_node_weight.zero_()
+            grad_edge_weight.zero_()
+
+        grad_node_bias = torch.empty_like(node_bias)
+        grad_node_residual = torch.empty_like(node_residual)
+        grad_edge_bias = torch.empty_like(edge_bias)
+        grad_edge_residual = torch.empty_like(edge_residual)
+        grad_sw = torch.empty_like(sw)
+        if M:
+            vector_kernel = fused_edge_block_backward_vectors(
+                M=M, N_NODE=n_node, C_NODE=c_node, C_EDGE=c_edge,
+                HAS_GRAD_NODE=has_grad_node, HAS_GRAD_EDGE=has_grad_edge,
+            )
+            vector_kernel(
+                grad_node_output, grad_edge_output, node_preact, edge_preact,
+                sw, owner, node_residual, edge_residual, float(scale_factor),
+                float(threshold), float(slope), float(const_value),
+                grad_node_bias, grad_node_residual,
+                grad_edge_bias, grad_edge_residual, grad_sw,
+            )
+        else:
+            grad_node_bias.zero_()
+            grad_node_residual.zero_()
+            grad_edge_bias.zero_()
+            grad_edge_residual.zero_()
+            grad_sw.zero_()
+
+        ctx.set_materialize_grads(False)
+        ctx.owner_metadata = owner_metadata
+        ctx.num_owner = num_owner
+        ctx.scale_factor = scale_factor
+        ctx.threshold = threshold
+        ctx.slope = slope
+        ctx.const_value = const_value
+        ctx.has_grad_node = has_grad_node
+        ctx.has_grad_edge = has_grad_edge
+        ctx.save_for_backward(
+            grad_node_output, grad_edge_output,
+            node_partial, node_ebd, node_ebd_ext, edge_ebd, sw,
+            owner, n_ext2e_index, node_weight, node_bias, node_residual,
+            edge_weight, edge_bias, edge_residual, node_preact, edge_preact,
+        )
+        grad_node_partial = grad_node_output
+        return (
+            grad_node_partial, grad_node, grad_node_ext, grad_edge, grad_sw,
+            grad_node_weight, grad_node_bias, grad_node_residual,
+            grad_edge_weight, grad_edge_bias, grad_edge_residual,
+        )
+
+    @staticmethod
+    def backward(
+        ctx,
+        u_node_partial,
+        u_node,
+        u_node_ext,
+        u_edge,
+        u_sw,
+        u_node_weight,
+        u_node_bias,
+        u_node_residual,
+        u_edge_weight,
+        u_edge_bias,
+        u_edge_residual,
+    ):
+        (
+            grad_node_output, grad_edge_output,
+            node_partial, node_ebd, node_ebd_ext, edge_ebd, sw,
+            owner, n_ext2e_index, node_weight, node_bias, node_residual,
+            edge_weight, edge_bias, edge_residual, node_preact, edge_preact,
+        ) = ctx.saved_tensors
+        M, c_edge = edge_ebd.shape
+        n_node, c_node = node_ebd.shape
+        n_node_ext = node_ebd_ext.shape[0]
+        d = 2 * c_node + c_edge
+
+        has_u_node_partial = u_node_partial is not None
+        has_u_node = u_node is not None
+        has_u_node_ext = u_node_ext is not None
+        has_u_edge = u_edge is not None
+        has_u_sw = u_sw is not None
+        has_u_node_weight = u_node_weight is not None
+        has_u_node_bias = u_node_bias is not None
+        has_u_node_residual = u_node_residual is not None
+        has_u_edge_weight = u_edge_weight is not None
+        has_u_edge_bias = u_edge_bias is not None
+        has_u_edge_residual = u_edge_residual is not None
+
+        u_node_partial_arg = (
+            u_node_partial.contiguous() if has_u_node_partial else node_partial
+        )
+        u_node_arg = u_node.contiguous() if has_u_node else node_ebd
+        u_node_ext_arg = (
+            u_node_ext.contiguous() if has_u_node_ext else node_ebd_ext
+        )
+        u_edge_arg = u_edge.contiguous() if has_u_edge else edge_ebd
+        u_sw_arg = u_sw.contiguous() if has_u_sw else sw
+        u_node_weight_arg = (
+            u_node_weight.contiguous() if has_u_node_weight else node_weight
+        )
+        u_node_bias_arg = (
+            u_node_bias.contiguous() if has_u_node_bias else node_bias
+        )
+        u_node_residual_arg = (
+            u_node_residual.contiguous()
+            if has_u_node_residual else node_residual
+        )
+        u_edge_weight_arg = (
+            u_edge_weight.contiguous() if has_u_edge_weight else edge_weight
+        )
+        u_edge_bias_arg = (
+            u_edge_bias.contiguous() if has_u_edge_bias else edge_bias
+        )
+        u_edge_residual_arg = (
+            u_edge_residual.contiguous()
+            if has_u_edge_residual else edge_residual
+        )
+
+        p_node = torch.empty((M, c_node), device=edge_ebd.device, dtype=edge_ebd.dtype)
+        p_edge = torch.empty_like(edge_ebd)
+        t_node = torch.empty_like(p_node)
+        t_edge = torch.empty_like(edge_ebd)
+        s_node = torch.empty_like(p_node)
+        s_edge = torch.empty_like(edge_ebd)
+        gg_edge_output = torch.empty_like(edge_ebd)
+        if M:
+            prepare_kernel = fused_edge_block_double_prepare(
+                M=M, N_NODE=n_node, N_NODE_EXT=n_node_ext,
+                C_NODE=c_node, C_EDGE=c_edge,
+                HAS_GRAD_NODE=ctx.has_grad_node,
+                HAS_GRAD_EDGE=ctx.has_grad_edge,
+                HAS_U_NODE=has_u_node,
+                HAS_U_NODE_EXT=has_u_node_ext,
+                HAS_U_EDGE=has_u_edge,
+                HAS_U_SW=has_u_sw,
+                HAS_U_NODE_WEIGHT=has_u_node_weight,
+                HAS_U_NODE_BIAS=has_u_node_bias,
+                HAS_U_NODE_RESIDUAL=has_u_node_residual,
+                HAS_U_EDGE_WEIGHT=has_u_edge_weight,
+                HAS_U_EDGE_BIAS=has_u_edge_bias,
+                HAS_U_EDGE_RESIDUAL=has_u_edge_residual,
+            )
+            prepare_kernel(
+                grad_node_output, grad_edge_output,
+                node_ebd, node_ebd_ext, edge_ebd, sw,
+                owner, n_ext2e_index, node_weight, node_residual,
+                edge_weight, edge_residual, node_preact, edge_preact,
+                u_node_arg, u_node_ext_arg, u_edge_arg, u_sw_arg,
+                u_node_weight_arg, u_node_bias_arg, u_node_residual_arg,
+                u_edge_weight_arg, u_edge_bias_arg, u_edge_residual_arg,
+                float(ctx.scale_factor), float(ctx.threshold),
+                float(ctx.slope), float(ctx.const_value),
+                p_node, p_edge, t_node, t_edge, s_node, s_edge,
+                gg_edge_output,
+            )
+        else:
+            gg_edge_output.zero_()
+
+        gg_node_output = torch.empty_like(grad_node_output)
+        uniform, offsets, order = ctx.owner_metadata
+        if M == 0:
+            if has_u_node_partial:
+                gg_node_output.copy_(u_node_partial_arg)
+            else:
+                gg_node_output.zero_()
+        else:
+            node_output_factory = (
+                fused_edge_block_double_node_output_uniform
+                if uniform else fused_edge_block_double_node_output_segmented
+            )
+            node_output_kernel = node_output_factory(
+                M=M, NO=ctx.num_owner, C_NODE=c_node,
+                HAS_U_NODE_PARTIAL=has_u_node_partial,
+                HAS_U_SW=has_u_sw,
+                HAS_U_NODE_RESIDUAL=has_u_node_residual,
+            )
+            metadata_args = () if uniform else (offsets, order)
+            node_output_kernel(
+                node_preact, t_node, sw, node_residual,
+                u_node_partial_arg, u_sw_arg, u_node_residual_arg,
+                *metadata_args, float(ctx.scale_factor),
+                float(ctx.threshold), float(ctx.slope),
+                float(ctx.const_value), gg_node_output,
+            )
+
+        grad_node = torch.zeros_like(node_ebd)
+        grad_node_ext = torch.zeros_like(node_ebd_ext)
+        grad_edge = torch.empty_like(edge_ebd)
+        if M:
+            inputs_kernel = fused_edge_block_double_inputs(
+                M=M, N_NODE=n_node, N_NODE_EXT=n_node_ext,
+                C_NODE=c_node, C_EDGE=c_edge,
+                HAS_U_NODE_WEIGHT=has_u_node_weight,
+                HAS_U_EDGE_WEIGHT=has_u_edge_weight,
+            )
+            inputs_kernel(
+                p_node, p_edge, s_node, s_edge,
+                node_weight, edge_weight,
+                u_node_weight_arg, u_edge_weight_arg,
+                owner, n_ext2e_index, grad_node, grad_node_ext, grad_edge,
+            )
+        else:
+            grad_edge.zero_()
+
+        split_m = 1
+        grad_node_weight = torch.empty_like(node_weight)
+        grad_edge_weight = torch.empty_like(edge_weight)
+        if M:
+            weight_kernel = fused_edge_block_double_weight_partials(
+                M=M, N_NODE=n_node, N_NODE_EXT=n_node_ext,
+                C_NODE=c_node, C_EDGE=c_edge, SPLIT_M=split_m,
+                HAS_U_NODE=has_u_node,
+                HAS_U_NODE_EXT=has_u_node_ext,
+                HAS_U_EDGE=has_u_edge,
+            )
+            if split_m == 1:
+                node_partials = grad_node_weight.unsqueeze(0)
+                edge_partials = grad_edge_weight.unsqueeze(0)
+            else:
+                node_partials = torch.empty(
+                    (split_m, d, c_node), device=edge_ebd.device,
+                    dtype=edge_ebd.dtype,
+                )
+                edge_partials = torch.empty(
+                    (split_m, d, c_edge), device=edge_ebd.device,
+                    dtype=edge_ebd.dtype,
+                )
+            weight_kernel(
+                node_ebd, node_ebd_ext, edge_ebd,
+                u_node_arg, u_node_ext_arg, u_edge_arg,
+                owner, n_ext2e_index, p_node, p_edge, s_node, s_edge,
+                node_partials, edge_partials,
+            )
+            if split_m > 1:
+                reduce_kernel = fused_edge_block_double_weight_reduce(
+                    D=d, C_NODE=c_node, C_EDGE=c_edge, SPLIT_M=split_m,
+                )
+                reduce_kernel(
+                    node_partials, edge_partials,
+                    grad_node_weight, grad_edge_weight,
+                )
+        else:
+            grad_node_weight.zero_()
+            grad_edge_weight.zero_()
+
+        grad_node_bias = torch.empty_like(node_bias)
+        grad_node_residual = torch.empty_like(node_residual)
+        grad_edge_bias = torch.empty_like(edge_bias)
+        grad_edge_residual = torch.empty_like(edge_residual)
+        grad_sw = torch.empty_like(sw)
+        if M:
+            vector_kernel = fused_edge_block_double_vectors(
+                M=M, N_NODE=n_node, C_NODE=c_node, C_EDGE=c_edge,
+                HAS_GRAD_NODE=ctx.has_grad_node,
+                HAS_GRAD_EDGE=ctx.has_grad_edge,
+                HAS_U_SW=has_u_sw,
+                HAS_U_NODE_RESIDUAL=has_u_node_residual,
+            )
+            vector_kernel(
+                grad_node_output, grad_edge_output,
+                node_preact, edge_preact, t_node, t_edge, s_node, s_edge,
+                sw, owner, node_residual, u_sw_arg, u_node_residual_arg,
+                float(ctx.scale_factor), float(ctx.threshold),
+                float(ctx.slope), float(ctx.const_value),
+                grad_node_bias, grad_node_residual,
+                grad_edge_bias, grad_edge_residual, grad_sw,
+            )
+        else:
+            grad_node_bias.zero_()
+            grad_node_residual.zero_()
+            grad_edge_bias.zero_()
+            grad_edge_residual.zero_()
+            grad_sw.zero_()
+
+        return (
+            gg_node_output, gg_edge_output,
+            None, grad_node, grad_node_ext, grad_edge, grad_sw,
+            None, None,
+            grad_node_weight, grad_node_bias, grad_node_residual,
+            grad_edge_weight, grad_edge_bias, grad_edge_residual,
+            None, None,
+            None, None, None, None, None, None, None, None,
+        )
+
+
+def fused_edge_block_dynamic(
+    node_partial,
+    node_ebd,
+    node_ebd_ext,
+    edge_ebd,
+    sw,
+    owner,
+    n_ext2e_index,
+    node_weight,
+    node_bias,
+    node_residual,
+    edge_weight,
+    edge_bias,
+    edge_residual,
+    num_owner,
+    scale_factor,
+    threshold,
+    slope,
+    const_value,
+    owner_metadata,
+):
+    """Run the wider twice-differentiable Edge block without materializing cat."""
+    node_shape = node_partial.shape
+    node_partial_flat = node_partial.reshape(num_owner, node_shape[-1])
+    node_flat = node_ebd.reshape(num_owner, node_ebd.shape[-1])
+    node_ext_flat = node_ebd_ext.reshape(-1, node_ebd_ext.shape[-1])
+    node_output, edge_output = FusedEdgeBlockFunction.apply(
+        node_partial_flat, node_flat, node_ext_flat, edge_ebd, sw,
+        owner, n_ext2e_index,
+        node_weight, node_bias, node_residual,
+        edge_weight, edge_bias, edge_residual,
+        num_owner, scale_factor, threshold, slope, const_value,
+        owner_metadata,
+    )
+    return node_output.reshape(node_shape), edge_output

@@ -40,6 +40,8 @@ from .utils_tilelang import (
     FusedAngleUpdateFunction,
     FusedEdgeUpdateFunction,
     FusedSymmetrizationOpDynamic,
+    _sym_owner_metadata,
+    fused_edge_block_dynamic as _fused_edge_block_dynamic,
     fused_sym_block_dynamic as _fused_sym_block_dynamic,
 )
 
@@ -563,6 +565,7 @@ class RepFlowLayer(torch.nn.Module):
         nloc: int,
         scale_factor: float,
         axis_neuron: int,
+        owner_metadata,
     ) -> torch.Tensor:
         """Wider dynamic Sym block used only by :meth:`forward_fused`."""
         assert self.node_sym_linear.bias is not None
@@ -590,6 +593,50 @@ class RepFlowLayer(torch.nn.Module):
             silut.threshold,
             silut.slope,
             const_value,
+            owner_metadata,
+        )
+
+    def fused_edge_block_dynamic(
+        self,
+        node_partial: torch.Tensor,
+        node_ebd: torch.Tensor,
+        node_ebd_ext: torch.Tensor,
+        edge_ebd: torch.Tensor,
+        sw: torch.Tensor,
+        owner: torch.Tensor,
+        n_ext2e_index: torch.Tensor,
+        num_owner: int,
+        scale_factor: float,
+        owner_metadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Wider twice-differentiable Edge block used by ``forward_fused``."""
+        assert self.node_edge_linear.bias is not None
+        assert self.edge_self_linear.bias is not None
+        assert self.act.silut is not None
+        silut = self.act.silut
+        const_value = (
+            silut.const_val if hasattr(silut, "const_val") else silut.const
+        )
+        return _fused_edge_block_dynamic(
+            node_partial,
+            node_ebd,
+            node_ebd_ext,
+            edge_ebd,
+            sw,
+            owner,
+            n_ext2e_index,
+            self.node_edge_linear.matrix,
+            self.node_edge_linear.bias,
+            self.n_residual[2],
+            self.edge_self_linear.matrix,
+            self.edge_self_linear.bias,
+            self.e_residual[0],
+            num_owner,
+            scale_factor,
+            silut.threshold,
+            silut.slope,
+            const_value,
+            owner_metadata,
         )
 
     def optim_angle_update(
@@ -1809,14 +1856,15 @@ class RepFlowLayer(torch.nn.Module):
         n_edge = h2.shape[0]
         del a_nlist
 
-        n2e_index, n_ext2e_index = edge_index[0], edge_index[1]
+        n2e_index = edge_index[0].long().contiguous()
+        n_ext2e_index = edge_index[1].long().contiguous()
+        owner_metadata = _sym_owner_metadata(n2e_index, nb * nloc)
         n2a_index, eij2a_index, eik2a_index = (
             angle_index[0],
             angle_index[1],
             angle_index[2],
         )
 
-        e_update_list: list[torch.Tensor] = [edge_ebd]
         a_update_list: list[torch.Tensor] = [angle_ebd]
 
         with torch.cuda.nvtx.range("node self update"):
@@ -1837,46 +1885,23 @@ class RepFlowLayer(torch.nn.Module):
             nloc=nloc,
             scale_factor=self.dynamic_e_sel ** (-0.5),
             axis_neuron=self.axis_neuron,
+            owner_metadata=owner_metadata,
         )
         torch.cuda.nvtx.range_pop()
 
-        torch.cuda.nvtx.range_push("G1 message pass")
-        node_edge_update = self.act(
-            self.fused_optim_edge_update_dynamic(
-                node_ebd,
-                node_ebd_ext,
-                edge_ebd,
-                n2e_index,
-                n_ext2e_index,
-                "node",
-            )
-        ) * sw.unsqueeze(-1)
-        node_edge_update = (
-            aggregate(
-                node_edge_update,
-                n2e_index,
-                average=False,
-                num_owner=nb * nloc,
-            ).reshape(nb, nloc, node_edge_update.shape[-1])
-            / self.dynamic_e_sel
+        torch.cuda.nvtx.range_push("expanded edge block")
+        n_updated, e_partial = self.fused_edge_block_dynamic(
+            node_partial,
+            node_ebd,
+            node_ebd_ext,
+            edge_ebd,
+            sw,
+            n2e_index,
+            n_ext2e_index,
+            num_owner=nb * nloc,
+            scale_factor=self.dynamic_e_sel ** (-1.0),
+            owner_metadata=owner_metadata,
         )
-        torch.cuda.nvtx.range_pop()
-
-        with torch.cuda.nvtx.range("node update"):
-            n_updated = node_partial + self.n_residual[2] * node_edge_update
-
-        torch.cuda.nvtx.range_push("atom to bond")
-        edge_self_update = self.act(
-            self.fused_optim_edge_update_dynamic(
-                node_ebd,
-                node_ebd_ext,
-                edge_ebd,
-                n2e_index,
-                n_ext2e_index,
-                "edge",
-            )
-        )
-        e_update_list.append(edge_self_update)
         torch.cuda.nvtx.range_pop()
 
         assert self.angle_self_linear is not None
@@ -1907,12 +1932,10 @@ class RepFlowLayer(torch.nn.Module):
             average=False,
             num_owner=n_edge,
         ) / (self.dynamic_a_sel**0.5)
-        e_update_list.append(
-            self.act(self.edge_angle_linear2(padding_edge_angle_update))
+        edge_angle_update = self.act(
+            self.edge_angle_linear2(padding_edge_angle_update)
         )
-        e_updated = e_update_list[0]
-        e_updated = e_updated + self.e_residual[0] * e_update_list[1]
-        e_updated = e_updated + self.e_residual[1] * e_update_list[2]
+        e_updated = e_partial + self.e_residual[1] * edge_angle_update
         torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_push("angle update")
@@ -1972,33 +1995,6 @@ class RepFlowLayer(torch.nn.Module):
                 uu = uu + vv * update_list[ii + 1]
         else:
             raise NotImplementedError
-        return uu
-
-    @torch.jit.export
-    def fuse_list_update_res_residual(
-        self, update_list: list[torch.Tensor], update_name: str = "node"
-    ) -> torch.Tensor:
-        nitem = len(update_list)
-        if nitem == 1:
-            return update_list[0]
-
-        uu = update_list[0]
-
-        if update_name == "node":
-            residuals = self.n_residual
-        elif update_name == "edge":
-            residuals = self.e_residual
-        elif update_name == "angle":
-            residuals = self.a_residual
-        else:
-            raise NotImplementedError
-
-        # 使用 addcmul 融合算子：计算 uu = uu + update_list * vv
-        # 完全避免了 vv * update_list 带来的中间张量显存开销，每个 item 仅 1 个 Kernel
-        for ii, vv in enumerate(residuals):
-            if ii + 1 < nitem:
-                uu = torch.addcmul(uu, update_list[ii + 1], vv)
-
         return uu
 
     @torch.jit.export
