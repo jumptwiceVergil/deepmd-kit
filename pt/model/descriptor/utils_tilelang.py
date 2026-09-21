@@ -6359,20 +6359,20 @@ def fused_sym_block_dual_hg_forward_uniform(
                 if col < D:
                     acc = T.alloc_var("float32", init=0)
                     if col < 3 * E_EDGE:
-                        b = col // E_EDGE
-                        d = col % E_EDGE
+                        edge_b = col // E_EDGE
+                        edge_d = col % E_EDGE
                         for r in T.serial(EDGES_PER_OWNER):
                             edge = owner * EDGES_PER_OWNER + r
-                            acc += edge_ebd[edge, d] * meta[r, 0] * meta[r, b + 1]
+                            acc += edge_ebd[edge, edge_d] * meta[r, 0] * meta[r, edge_b + 1]
                         h_edge[owner, col] = acc * scale
                     else:
                         local = col - 3 * E_EDGE
-                        b = local // E_NODE
-                        d = local % E_NODE
+                        node_b = local // E_NODE
+                        node_d = local % E_NODE
                         for r in T.serial(EDGES_PER_OWNER):
                             edge = owner * EDGES_PER_OWNER + r
                             node = n_ext2e_index[edge]
-                            acc += node_ebd_ext[node, d] * meta[r, 0] * meta[r, b + 1]
+                            acc += node_ebd_ext[node, node_d] * meta[r, 0] * meta[r, node_b + 1]
                         h_node[owner, local] = acc * scale
 
     return hg_forward_uniform
@@ -6404,20 +6404,20 @@ def fused_sym_block_dual_hg_forward_segmented(
                 if col < D:
                     acc = T.alloc_var("float32", init=0)
                     if col < 3 * E_EDGE:
-                        b = col // E_EDGE
-                        d = col % E_EDGE
+                        edge_b = col // E_EDGE
+                        edge_d = col % E_EDGE
                         for r in T.serial(offsets[owner], offsets[owner + 1]):
                             edge = order[r]
-                            acc += edge_ebd[edge, d] * sw[edge] * h2[edge, b]
+                            acc += edge_ebd[edge, edge_d] * sw[edge] * h2[edge, edge_b]
                         h_edge[owner, col] = acc * scale
                     else:
                         local = col - 3 * E_EDGE
-                        b = local // E_NODE
-                        d = local % E_NODE
+                        node_b = local // E_NODE
+                        node_d = local % E_NODE
                         for r in T.serial(offsets[owner], offsets[owner + 1]):
                             edge = order[r]
                             node = n_ext2e_index[edge]
-                            acc += node_ebd_ext[node, d] * sw[edge] * h2[edge, b]
+                            acc += node_ebd_ext[node, node_d] * sw[edge] * h2[edge, node_b]
                         h_node[owner, local] = acc * scale
 
     return hg_forward_segmented
@@ -6442,17 +6442,17 @@ def fused_sym_block_dual_grrg_forward(NO, E_EDGE, E_NODE, A, BLOCK_N=128):
                 if col < DQ:
                     acc = T.alloc_var("float32", init=0)
                     if col < DQ_EDGE:
-                        a = col // E_EDGE
-                        d = col % E_EDGE
+                        edge_a = col // E_EDGE
+                        edge_d = col % E_EDGE
                         for b in T.serial(3):
-                            acc += h_edge[owner, b * E_EDGE + a] * h_edge[owner, b * E_EDGE + d]
+                            acc += h_edge[owner, b * E_EDGE + edge_a] * h_edge[owner, b * E_EDGE + edge_d]
                         q_edge[owner, col] = acc / 3.0
                     else:
                         local = col - DQ_EDGE
-                        a = local // E_NODE
-                        d = local % E_NODE
+                        node_a = local // E_NODE
+                        node_d = local % E_NODE
                         for b in T.serial(3):
-                            acc += h_node[owner, b * E_NODE + a] * h_node[owner, b * E_NODE + d]
+                            acc += h_node[owner, b * E_NODE + node_a] * h_node[owner, b * E_NODE + node_d]
                         q_node[owner, local] = acc / 3.0
 
     return grrg_forward
@@ -6896,6 +6896,10 @@ def fused_sym_block_projection_double_ts_output(
                 c = by * BLOCK_N + ni
                 if n < N and c < C:
                     z = preact[n, c]
+                    t = T.alloc_var("float32")
+                    p = T.alloc_var("float32")
+                    s = T.alloc_var("float32")
+                    gg = T.alloc_var("float32")
                     value = T.alloc_var("float32")
                     deriv = T.alloc_var("float32")
                     second = T.alloc_var("float32")
@@ -8089,28 +8093,28 @@ def fused_edge_block_backward_inputs(
                     if edge < M and c < C:
                         if c < C_NODE:
                             if HAS_GRAD_NODE:
-                                z = node_preact[edge, c]
+                                node_z = node_preact[edge, c]
                                 deriv = T.alloc_var("float32")
-                                if z >= threshold:
-                                    th = T.tanh(slope * (z - threshold))
+                                if node_z >= threshold:
+                                    th = T.tanh(slope * (node_z - threshold))
                                     deriv = slope * (1.0 - th * th)
                                 else:
-                                    sig = 1.0 / (1.0 + T.exp(-z))
-                                    deriv = sig * (1.0 + z * (1.0 - sig))
+                                    sig = 1.0 / (1.0 + T.exp(-node_z))
+                                    deriv = sig * (1.0 + node_z * (1.0 - sig))
                                 p[mi, ki] = grad_node_output[owner[edge], c] * node_residual[c] * scale * sw[edge] * deriv
                             else:
                                 p[mi, ki] = 0
                         else:
                             ce = c - C_NODE
                             if HAS_GRAD_EDGE:
-                                z = edge_preact[edge, ce]
+                                edge_z = edge_preact[edge, ce]
                                 deriv = T.alloc_var("float32")
-                                if z >= threshold:
-                                    th = T.tanh(slope * (z - threshold))
+                                if edge_z >= threshold:
+                                    th = T.tanh(slope * (edge_z - threshold))
                                     deriv = slope * (1.0 - th * th)
                                 else:
-                                    sig = 1.0 / (1.0 + T.exp(-z))
-                                    deriv = sig * (1.0 + z * (1.0 - sig))
+                                    sig = 1.0 / (1.0 + T.exp(-edge_z))
+                                    deriv = sig * (1.0 + edge_z * (1.0 - sig))
                                 p[mi, ki] = grad_edge_output[edge, ce] * edge_residual[ce] * deriv
                             else:
                                 p[mi, ki] = 0
@@ -8202,28 +8206,28 @@ def fused_edge_block_backward_weight_partials(
                     if edge < M and c < C:
                         if c < C_NODE:
                             if HAS_GRAD_NODE:
-                                z = node_preact[edge, c]
+                                node_z = node_preact[edge, c]
                                 deriv = T.alloc_var("float32")
-                                if z >= threshold:
-                                    th = T.tanh(slope * (z - threshold))
+                                if node_z >= threshold:
+                                    th = T.tanh(slope * (node_z - threshold))
                                     deriv = slope * (1.0 - th * th)
                                 else:
-                                    sig = 1.0 / (1.0 + T.exp(-z))
-                                    deriv = sig * (1.0 + z * (1.0 - sig))
+                                    sig = 1.0 / (1.0 + T.exp(-node_z))
+                                    deriv = sig * (1.0 + node_z * (1.0 - sig))
                                 p[mi, ci] = grad_node_output[owner[edge], c] * node_residual[c] * scale * sw[edge] * deriv
                             else:
                                 p[mi, ci] = 0
                         else:
                             ce = c - C_NODE
                             if HAS_GRAD_EDGE:
-                                z = edge_preact[edge, ce]
+                                edge_z = edge_preact[edge, ce]
                                 deriv = T.alloc_var("float32")
-                                if z >= threshold:
-                                    th = T.tanh(slope * (z - threshold))
+                                if edge_z >= threshold:
+                                    th = T.tanh(slope * (edge_z - threshold))
                                     deriv = slope * (1.0 - th * th)
                                 else:
-                                    sig = 1.0 / (1.0 + T.exp(-z))
-                                    deriv = sig * (1.0 + z * (1.0 - sig))
+                                    sig = 1.0 / (1.0 + T.exp(-edge_z))
+                                    deriv = sig * (1.0 + edge_z * (1.0 - sig))
                                 p[mi, ci] = grad_edge_output[edge, ce] * edge_residual[ce] * deriv
                             else:
                                 p[mi, ci] = 0
