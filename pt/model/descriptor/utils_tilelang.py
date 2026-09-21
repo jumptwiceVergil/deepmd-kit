@@ -7899,7 +7899,7 @@ def fused_sym_block_dynamic(
 @tilelang.jit
 def fused_edge_block_projection_forward(
     M, N_NODE, N_NODE_EXT, C_NODE, C_EDGE,
-    BLOCK_M=32, BLOCK_N=32, BLOCK_K=32,
+    BLOCK_M=64, BLOCK_N=64, BLOCK_K=64,
 ):
     D = 2 * C_NODE + C_EDGE
     C = C_NODE + C_EDGE
