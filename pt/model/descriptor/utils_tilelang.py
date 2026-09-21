@@ -8094,28 +8094,28 @@ def fused_edge_block_backward_inputs(
                         if c < C_NODE:
                             if HAS_GRAD_NODE:
                                 node_z = node_preact[edge, c]
-                                deriv = T.alloc_var("float32")
+                                node_deriv = T.alloc_var("float32")
                                 if node_z >= threshold:
-                                    th = T.tanh(slope * (node_z - threshold))
-                                    deriv = slope * (1.0 - th * th)
+                                    node_th = T.tanh(slope * (node_z - threshold))
+                                    node_deriv = slope * (1.0 - node_th * node_th)
                                 else:
-                                    sig = 1.0 / (1.0 + T.exp(-node_z))
-                                    deriv = sig * (1.0 + node_z * (1.0 - sig))
-                                p[mi, ki] = grad_node_output[owner[edge], c] * node_residual[c] * scale * sw[edge] * deriv
+                                    node_sig = 1.0 / (1.0 + T.exp(-node_z))
+                                    node_deriv = node_sig * (1.0 + node_z * (1.0 - node_sig))
+                                p[mi, ki] = grad_node_output[owner[edge], c] * node_residual[c] * scale * sw[edge] * node_deriv
                             else:
                                 p[mi, ki] = 0
                         else:
                             ce = c - C_NODE
                             if HAS_GRAD_EDGE:
                                 edge_z = edge_preact[edge, ce]
-                                deriv = T.alloc_var("float32")
+                                edge_deriv = T.alloc_var("float32")
                                 if edge_z >= threshold:
-                                    th = T.tanh(slope * (edge_z - threshold))
-                                    deriv = slope * (1.0 - th * th)
+                                    edge_th = T.tanh(slope * (edge_z - threshold))
+                                    edge_deriv = slope * (1.0 - edge_th * edge_th)
                                 else:
-                                    sig = 1.0 / (1.0 + T.exp(-edge_z))
-                                    deriv = sig * (1.0 + edge_z * (1.0 - sig))
-                                p[mi, ki] = grad_edge_output[edge, ce] * edge_residual[ce] * deriv
+                                    edge_sig = 1.0 / (1.0 + T.exp(-edge_z))
+                                    edge_deriv = edge_sig * (1.0 + edge_z * (1.0 - edge_sig))
+                                p[mi, ki] = grad_edge_output[edge, ce] * edge_residual[ce] * edge_deriv
                             else:
                                 p[mi, ki] = 0
                     else:
@@ -8207,28 +8207,28 @@ def fused_edge_block_backward_weight_partials(
                         if c < C_NODE:
                             if HAS_GRAD_NODE:
                                 node_z = node_preact[edge, c]
-                                deriv = T.alloc_var("float32")
+                                node_deriv = T.alloc_var("float32")
                                 if node_z >= threshold:
-                                    th = T.tanh(slope * (node_z - threshold))
-                                    deriv = slope * (1.0 - th * th)
+                                    node_th = T.tanh(slope * (node_z - threshold))
+                                    node_deriv = slope * (1.0 - node_th * node_th)
                                 else:
-                                    sig = 1.0 / (1.0 + T.exp(-node_z))
-                                    deriv = sig * (1.0 + node_z * (1.0 - sig))
-                                p[mi, ci] = grad_node_output[owner[edge], c] * node_residual[c] * scale * sw[edge] * deriv
+                                    node_sig = 1.0 / (1.0 + T.exp(-node_z))
+                                    node_deriv = node_sig * (1.0 + node_z * (1.0 - node_sig))
+                                p[mi, ci] = grad_node_output[owner[edge], c] * node_residual[c] * scale * sw[edge] * node_deriv
                             else:
                                 p[mi, ci] = 0
                         else:
                             ce = c - C_NODE
                             if HAS_GRAD_EDGE:
                                 edge_z = edge_preact[edge, ce]
-                                deriv = T.alloc_var("float32")
+                                edge_deriv = T.alloc_var("float32")
                                 if edge_z >= threshold:
-                                    th = T.tanh(slope * (edge_z - threshold))
-                                    deriv = slope * (1.0 - th * th)
+                                    edge_th = T.tanh(slope * (edge_z - threshold))
+                                    edge_deriv = slope * (1.0 - edge_th * edge_th)
                                 else:
-                                    sig = 1.0 / (1.0 + T.exp(-edge_z))
-                                    deriv = sig * (1.0 + edge_z * (1.0 - sig))
-                                p[mi, ci] = grad_edge_output[edge, ce] * edge_residual[ce] * deriv
+                                    edge_sig = 1.0 / (1.0 + T.exp(-edge_z))
+                                    edge_deriv = edge_sig * (1.0 + edge_z * (1.0 - edge_sig))
+                                p[mi, ci] = grad_edge_output[edge, ce] * edge_residual[ce] * edge_deriv
                             else:
                                 p[mi, ci] = 0
                     else:
@@ -8312,20 +8312,20 @@ def fused_edge_block_backward_vectors(
                 acc_r = T.alloc_var("float32", init=0)
                 if HAS_GRAD_NODE:
                     for edge in T.serial(tx, M, THREADS):
-                        z = node_preact[edge, block]
-                        value = T.alloc_var("float32")
-                        deriv = T.alloc_var("float32")
-                        if z >= threshold:
-                            th = T.tanh(slope * (z - threshold))
-                            value = th + const_value
-                            deriv = slope * (1.0 - th * th)
+                        node_z = node_preact[edge, block]
+                        node_value = T.alloc_var("float32")
+                        node_deriv = T.alloc_var("float32")
+                        if node_z >= threshold:
+                            node_th = T.tanh(slope * (node_z - threshold))
+                            node_value = node_th + const_value
+                            node_deriv = slope * (1.0 - node_th * node_th)
                         else:
-                            sig = 1.0 / (1.0 + T.exp(-z))
-                            value = z * sig
-                            deriv = sig * (1.0 + z * (1.0 - sig))
-                        g = grad_node_output[owner[edge], block]
-                        acc_b += g * node_residual[block] * scale * sw[edge] * deriv
-                        acc_r += g * scale * sw[edge] * value
+                            node_sig = 1.0 / (1.0 + T.exp(-node_z))
+                            node_value = node_z * node_sig
+                            node_deriv = node_sig * (1.0 + node_z * (1.0 - node_sig))
+                        node_g = grad_node_output[owner[edge], block]
+                        acc_b += node_g * node_residual[block] * scale * sw[edge] * node_deriv
+                        acc_r += node_g * scale * sw[edge] * node_value
                 sh0[tx] = acc_b
                 sh1[tx] = acc_r
                 T.sync_threads()
@@ -8342,20 +8342,20 @@ def fused_edge_block_backward_vectors(
                 acc_r = T.alloc_var("float32", init=0)
                 if HAS_GRAD_EDGE:
                     for edge in T.serial(tx, M, THREADS):
-                        z = edge_preact[edge, block]
-                        value = T.alloc_var("float32")
-                        deriv = T.alloc_var("float32")
-                        if z >= threshold:
-                            th = T.tanh(slope * (z - threshold))
-                            value = th + const_value
-                            deriv = slope * (1.0 - th * th)
+                        edge_z = edge_preact[edge, block]
+                        edge_value = T.alloc_var("float32")
+                        edge_deriv = T.alloc_var("float32")
+                        if edge_z >= threshold:
+                            edge_th = T.tanh(slope * (edge_z - threshold))
+                            edge_value = edge_th + const_value
+                            edge_deriv = slope * (1.0 - edge_th * edge_th)
                         else:
-                            sig = 1.0 / (1.0 + T.exp(-z))
-                            value = z * sig
-                            deriv = sig * (1.0 + z * (1.0 - sig))
-                        g = grad_edge_output[edge, block]
-                        acc_b += g * edge_residual[block] * deriv
-                        acc_r += g * value
+                            edge_sig = 1.0 / (1.0 + T.exp(-edge_z))
+                            edge_value = edge_z * edge_sig
+                            edge_deriv = edge_sig * (1.0 + edge_z * (1.0 - edge_sig))
+                        edge_g = grad_edge_output[edge, block]
+                        acc_b += edge_g * edge_residual[block] * edge_deriv
+                        acc_r += edge_g * edge_value
                 sh0[tx] = acc_b
                 sh1[tx] = acc_r
                 T.sync_threads()
@@ -8371,14 +8371,14 @@ def fused_edge_block_backward_vectors(
                 acc_sw = T.alloc_var("float32", init=0)
                 if HAS_GRAD_NODE:
                     for c in T.serial(tx, C_NODE, THREADS):
-                        z = node_preact[block, c]
-                        value = T.alloc_var("float32")
-                        if z >= threshold:
-                            value = T.tanh(slope * (z - threshold)) + const_value
+                        sw_z = node_preact[block, c]
+                        sw_value = T.alloc_var("float32")
+                        if sw_z >= threshold:
+                            sw_value = T.tanh(slope * (sw_z - threshold)) + const_value
                         else:
-                            sig = 1.0 / (1.0 + T.exp(-z))
-                            value = z * sig
-                        acc_sw += grad_node_output[owner[block], c] * node_residual[c] * scale * value
+                            sw_sig = 1.0 / (1.0 + T.exp(-sw_z))
+                            sw_value = sw_z * sw_sig
+                        acc_sw += grad_node_output[owner[block], c] * node_residual[c] * scale * sw_value
                 sh0[tx] = acc_sw
                 T.sync_threads()
                 red0 = T.alloc_shared((1,), "float32")
