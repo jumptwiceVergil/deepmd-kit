@@ -1889,19 +1889,63 @@ class RepFlowLayer(torch.nn.Module):
         )
         torch.cuda.nvtx.range_pop()
 
-        torch.cuda.nvtx.range_push("expanded edge block")
-        n_updated, e_partial = self.fused_edge_block_dynamic(
-            node_partial,
-            node_ebd,
-            node_ebd_ext,
-            edge_ebd,
-            sw,
-            n2e_index,
-            n_ext2e_index,
-            num_owner=nb * nloc,
-            scale_factor=self.dynamic_e_sel ** (-1.0),
-            owner_metadata=owner_metadata,
+        # Keep the expanded Edge path here so it can be re-enabled after the
+        # expanded-Sym-only benchmark.
+        # torch.cuda.nvtx.range_push("expanded edge block")
+        # n_updated, e_partial = self.fused_edge_block_dynamic(
+        #     node_partial,
+        #     node_ebd,
+        #     node_ebd_ext,
+        #     edge_ebd,
+        #     sw,
+        #     n2e_index,
+        #     n_ext2e_index,
+        #     num_owner=nb * nloc,
+        #     scale_factor=self.dynamic_e_sel ** (-1.0),
+        #     owner_metadata=owner_metadata,
+        # )
+        # torch.cuda.nvtx.range_pop()
+
+        # Original-range Edge path: fuse only the three input projections and
+        # keep activation, switching, owner reduction, and residual updates as
+        # separate operations, matching the specialized branch in forward().
+        torch.cuda.nvtx.range_push("G1 message pass")
+        node_edge_update = self.act(
+            self.fused_optim_edge_update_dynamic(
+                node_ebd,
+                node_ebd_ext,
+                edge_ebd,
+                n2e_index,
+                n_ext2e_index,
+                "node",
+            )
+        ) * sw.unsqueeze(-1)
+        node_edge_update = (
+            aggregate(
+                node_edge_update,
+                n2e_index,
+                average=False,
+                num_owner=nb * nloc,
+            ).reshape(nb, nloc, node_edge_update.shape[-1])
+            / self.dynamic_e_sel
         )
+        torch.cuda.nvtx.range_pop()
+
+        with torch.cuda.nvtx.range("node update"):
+            n_updated = node_partial + self.n_residual[2] * node_edge_update
+
+        torch.cuda.nvtx.range_push("atom to bond")
+        edge_self_update = self.act(
+            self.fused_optim_edge_update_dynamic(
+                node_ebd,
+                node_ebd_ext,
+                edge_ebd,
+                n2e_index,
+                n_ext2e_index,
+                "edge",
+            )
+        )
+        e_partial = edge_ebd + self.e_residual[0] * edge_self_update
         torch.cuda.nvtx.range_pop()
 
         assert self.angle_self_linear is not None
